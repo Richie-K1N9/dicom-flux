@@ -2,6 +2,7 @@
 """dicom.flux - portable DICOM tester (Echo, MWL, Store, Print + built-in SCP)."""
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import os
@@ -2550,6 +2551,16 @@ class MainWindow(QMainWindow):
 # main
 # ---------------------------------------------------------------------------
 def main():
+    # Tell Windows this is its own app (not pythonw.exe) so the taskbar
+    # button and alt-tab thumbnail show our icon instead of the Python one.
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "dicom-flux.app.1"
+            )
+        except Exception:
+            pass
+
     install_pynetdicom_log_bridge()
     init_sample_datasets()
     init_mwl_entries()
@@ -2563,9 +2574,11 @@ def main():
     # Do not call setApplicationDisplayName — Qt would auto-append it to
     # every window title (producing "[dicom.flux] v1.0.0 - [dicom.flux]").
     app.setOrganizationName(APP_NAME)
-    app.setWindowIcon(load_app_icon())
+    icon = load_app_icon()
+    app.setWindowIcon(icon)
 
     win = MainWindow(cfg)
+    win.setWindowIcon(icon)
     win.show()
     sys.exit(app.exec())
 
