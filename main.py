@@ -56,6 +56,7 @@ from pynetdicom.sop_class import (
 
 from PySide6.QtCore import Qt, QObject, Signal, QThread, QTimer, Slot, QSize, QDate
 from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QBrush, QAction, QPalette
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -115,6 +116,60 @@ MODALITIES = ["CT", "MR", "CR", "DX", "US", "MG"]
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+def asset_path(name: str) -> Path:
+    """Return the path to a bundled asset, working both when running from
+    source and when packaged with PyInstaller (`sys._MEIPASS`)."""
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        return Path(base) / "assets" / name
+    return Path(__file__).resolve().parent / "assets" / name
+
+
+def load_app_icon() -> QIcon:
+    """Build the application QIcon by rendering the SVG to several pixmap
+    sizes (so taskbar / alt-tab / window decorations all get a crisp image).
+    Falls back to the bundled .ico if the SVG is missing."""
+    svg_path = asset_path("dicom_flux.svg")
+    if svg_path.exists():
+        renderer = QSvgRenderer(str(svg_path))
+        if renderer.isValid():
+            icon = QIcon()
+            for size in (16, 24, 32, 48, 64, 128, 256):
+                pm = QPixmap(size, size)
+                pm.fill(Qt.transparent)
+                painter = QPainter(pm)
+                painter.setRenderHint(QPainter.Antialiasing, True)
+                painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                renderer.render(painter)
+                painter.end()
+                icon.addPixmap(pm)
+            return icon
+    ico_path = asset_path("dicom_flux.ico")
+    if ico_path.exists():
+        return QIcon(str(ico_path))
+    return QIcon()
+
+
+def get_local_ip() -> str:
+    """Return the primary outbound IPv4 address of this machine.
+
+    Uses a connected UDP socket trick - no packet is actually sent, but it
+    forces the OS to resolve the source address that would be used for a
+    public destination, which is what other DICOM nodes on the LAN will see.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "127.0.0.1"
+    finally:
+        s.close()
+
+
 def load_config() -> dict:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if CONFIG_FILE.exists():
@@ -1123,7 +1178,35 @@ THEMES = {
 }
 
 
+_chevron_paths: dict[str, str] = {}
+
+
+def chevron_svg_path(color: str) -> str:
+    """Write a small chevron SVG to a temp file and return its path for use
+    in QSS `image: url(...)`. Cached per colour."""
+    cached = _chevron_paths.get(color)
+    if cached and Path(cached).exists():
+        return cached
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" '
+        'viewBox="0 0 14 14">'
+        f'<path d="M3.2 5.5 L7 9.3 L10.8 5.5" stroke="{color}" '
+        'stroke-width="1.6" fill="none" stroke-linecap="round" '
+        'stroke-linejoin="round"/></svg>'
+    )
+    name = f"dicom_flux_chevron_{color.lstrip('#').lower()}.svg"
+    path = Path(tempfile.gettempdir()) / name
+    try:
+        path.write_text(svg, encoding="utf-8")
+    except Exception:
+        return ""
+    url = str(path).replace("\\", "/")
+    _chevron_paths[color] = url
+    return url
+
+
 def build_qss(theme: dict) -> str:
+    chevron = chevron_svg_path("#ffffff")
     return f"""
     /* Color top-level containers explicitly. We avoid the broad
        `QWidget {{ background-color: ... }}` rule because Qt then applies
@@ -1169,6 +1252,21 @@ def build_qss(theme: dict) -> str:
         background-color: {theme['input']};
         selection-background-color: {theme['selected']};
         color: {theme['fg']};
+        border: 1px solid {theme['border']};
+        outline: 0;
+        padding: 2px;
+    }}
+    QComboBox::drop-down {{
+        subcontrol-origin: padding;
+        subcontrol-position: top right;
+        width: 22px;
+        border: none;
+        background: transparent;
+    }}
+    QComboBox::down-arrow {{
+        image: url({chevron});
+        width: 14px;
+        height: 14px;
     }}
     QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{
         border: 1px solid {theme['accent']};
@@ -1211,13 +1309,17 @@ def build_qss(theme: dict) -> str:
         border: 1px solid {theme['fg']};
     }}
     QTabWidget::pane {{
-        border: 1px solid {theme['border']};
+        /* No top border — where there is no tab covering the pane edge
+           (the spacer area between tab groups, or to the right of the
+           last tab when the window is wider than all tabs combined),
+           a top border would show as a stray horizontal line. The tab
+           borders themselves provide the visual separation. */
+        border-top: 0;
+        border-left: 1px solid {theme['border']};
+        border-right: 1px solid {theme['border']};
+        border-bottom: 1px solid {theme['border']};
         background-color: {theme['bg']};
-        top: -1px;
-    }}
-    QTabWidget::tab-bar {{
-        top: 6px;
-        left: 0;
+        top: 0;
     }}
     QTabBar {{
         background-color: {theme['bg']};
@@ -2290,13 +2392,23 @@ class GroupedTabBar(QTabBar):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._spacer_index = -1
+        self.setExpanding(False)
+        self.setDrawBase(False)
 
     def set_spacer_index(self, idx: int):
         self._spacer_index = idx
 
+    def _available_width(self) -> int:
+        # Prefer the parent QTabWidget's width (the bar is laid out inside
+        # it and gets full width), falling back to our own width.
+        if self.parent() is not None:
+            w = self.parent().width()
+            if w > 0:
+                return w
+        return self.width()
+
     def tabSizeHint(self, index):
         if index == self._spacer_index and self._spacer_index >= 0 and self.count() > 1:
-            available = self.parent().width() if self.parent() else self.width()
             others = 0
             base_h = 30
             for i in range(self.count()):
@@ -2306,8 +2418,32 @@ class GroupedTabBar(QTabBar):
                 others += s.width()
                 if s.height() > base_h:
                     base_h = s.height()
-            return QSize(max(0, available - others - 8), base_h)
+            return QSize(max(0, self._available_width() - others), base_h)
         return super().tabSizeHint(index)
+
+    def sizeHint(self):
+        base = super().sizeHint()
+        # Make the bar's preferred width follow the parent width so the
+        # spacer always has enough room and the bar covers the full pane.
+        if self.parent() is not None:
+            return QSize(max(base.width(), self.parent().width()), base.height())
+        return base
+
+    def minimumSizeHint(self):
+        base = super().minimumSizeHint()
+        return QSize(base.width(), base.height())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._invalidate_layout()
+
+    def _invalidate_layout(self):
+        if 0 <= self._spacer_index < self.count():
+            # Toggling the tab text forces QTabBar to recompute internal
+            # tab geometry (calls tabSizeHint again).
+            old = self.tabText(self._spacer_index)
+            self.setTabText(self._spacer_index, old + " ")
+            self.setTabText(self._spacer_index, old)
 
     def mousePressEvent(self, event):
         idx = self.tabAt(event.pos())
@@ -2361,7 +2497,8 @@ class MainWindow(QMainWindow):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self._scp_label = QLabel("")
-        self.status.addPermanentWidget(self._scp_label)
+        # addWidget puts it on the left of the status bar.
+        self.status.addWidget(self._scp_label)
         self._update_status()
 
         self.apply_theme()
@@ -2397,8 +2534,11 @@ class MainWindow(QMainWindow):
         app.setStyleSheet(build_qss(theme))
 
     def _update_status(self):
+        ip = get_local_ip()
         self._scp_label.setText(
-            f"  Listening: AE='{self.cfg['local_ae']}' port {self.cfg['local_port']}  "
+            f"  Listening IP: {ip}   "
+            f"Port: {self.cfg['local_port']}   "
+            f"AE: '{self.cfg['local_ae']}'  "
         )
 
     def closeEvent(self, event):
@@ -2423,6 +2563,7 @@ def main():
     # Do not call setApplicationDisplayName — Qt would auto-append it to
     # every window title (producing "[dicom.flux] v1.0.0 - [dicom.flux]").
     app.setOrganizationName(APP_NAME)
+    app.setWindowIcon(load_app_icon())
 
     win = MainWindow(cfg)
     win.show()

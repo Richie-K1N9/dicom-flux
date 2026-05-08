@@ -16,11 +16,22 @@ python main.py
 
 ## Build a single-file executable
 
+The build embeds the application icon (rendered from
+`assets/dicom_flux.svg`). Re-generate the multi-resolution `.ico` once
+whenever the SVG changes:
+
+```bash
+python build_icon.py
+```
+
 ### Windows (`.exe`)
 
 ```bat
 pip install pyinstaller
-pyinstaller --onefile --windowed --name dicom.flux main.py
+pyinstaller --onefile --windowed ^
+            --icon assets\dicom_flux.ico ^
+            --add-data "assets\dicom_flux.svg;assets" ^
+            --name dicom.flux main.py
 ```
 
 The binary is written to `dist\dicom.flux.exe`.
@@ -29,11 +40,15 @@ The binary is written to `dist\dicom.flux.exe`.
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --name dicom.flux main.py
+pyinstaller --onefile \
+            --add-data "assets/dicom_flux.svg:assets" \
+            --name dicom.flux main.py
 ```
 
 The binary is written to `dist/dicom.flux`. Build on the target distro/glibc
-you intend to run on.
+you intend to run on. (Linux executables don't carry a file icon — use a
+`.desktop` entry pointing at `assets/dicom_flux.svg` if you want a launcher
+icon.)
 
 ## Tests provided
 

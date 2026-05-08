@@ -1,0 +1,34 @@
+<svg viewBox="0 0 680 680" xmlns="http://www.w3.org/2000/svg" role="img">
+  <title>[d.f] application logo</title>
+  <desc>A square application logo featuring the text [d.f] drawn as vector paths so it renders identically regardless of installed fonts.</desc>
+
+  <!-- Background panel -->
+  <rect x="140" y="140" width="400" height="400" rx="48" fill="#1a1a2e"/>
+  <rect x="140" y="140" width="400" height="400" rx="48" fill="none" stroke="#7c6af7" stroke-width="1.5" opacity="0.35"/>
+
+  <!-- Decorative corner ticks -->
+  <polyline points="172,178 155,178 155,195" fill="none" stroke="#7c6af7" stroke-width="2.5" opacity="0.5" stroke-linecap="round"/>
+  <polyline points="508,178 525,178 525,195" fill="none" stroke="#7c6af7" stroke-width="2.5" opacity="0.5" stroke-linecap="round"/>
+  <polyline points="172,502 155,502 155,485" fill="none" stroke="#7c6af7" stroke-width="2.5" opacity="0.5" stroke-linecap="round"/>
+  <polyline points="508,502 525,502 525,485" fill="none" stroke="#7c6af7" stroke-width="2.5" opacity="0.5" stroke-linecap="round"/>
+
+  <!-- [d.f] glyphs drawn as primitives -->
+  <g fill="none" stroke-width="16" stroke-linecap="round" stroke-linejoin="round">
+    <!-- [  -->
+    <path d="M 217 285 L 188 285 L 188 435 L 217 435" stroke="#a89ef8"/>
+
+    <!-- d : bowl + ascender -->
+    <circle cx="266" cy="392" r="26" stroke="#e8e8f0"/>
+    <line x1="298" y1="280" x2="298" y2="430" stroke="#e8e8f0"/>
+
+    <!-- f : top hook + crossbar + stem -->
+    <path d="M 442 290 Q 410 290 410 320 L 410 430" stroke="#e8e8f0"/>
+    <line x1="386" y1="352" x2="432" y2="352" stroke="#e8e8f0"/>
+
+    <!-- ] -->
+    <path d="M 463 285 L 492 285 L 492 435 L 463 435" stroke="#a89ef8"/>
+  </g>
+
+  <!-- . dot -->
+  <circle cx="340" cy="416" r="13" fill="#a89ef8"/>
+</svg>
