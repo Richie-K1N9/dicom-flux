@@ -54,8 +54,8 @@ from pynetdicom.sop_class import (
     Printer,
 )
 
-from PySide6.QtCore import Qt, QObject, Signal, QThread, QTimer, Slot
-from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QBrush, QAction
+from PySide6.QtCore import Qt, QObject, Signal, QThread, QTimer, Slot, QSize, QDate
+from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QBrush, QAction, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -83,9 +83,14 @@ from PySide6.QtWidgets import (
     QFrame,
     QCheckBox,
     QStyledItemDelegate,
+    QAbstractSpinBox,
+    QTabBar,
+    QDialog,
+    QDialogButtonBox,
+    QCalendarWidget,
 )
 
-APP_NAME = "dicom.flux"
+APP_NAME = "[dicom.flux]"
 APP_VERSION = "1.0.0"
 CONFIG_DIR = Path.home() / ".dicom_flux"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -104,7 +109,7 @@ MEDIUM_TYPES = [
     "MAMMO BLUE FILM",
 ]
 
-MODALITIES = ["CT", "MR", "CR", "DX", "US", "XA"]
+MODALITIES = ["CT", "MR", "CR", "DX", "US", "MG"]
 
 
 # ---------------------------------------------------------------------------
@@ -131,9 +136,21 @@ def save_config(cfg: dict) -> None:
 # ---------------------------------------------------------------------------
 class LogBus(QObject):
     log = Signal(dict)
+    received = Signal(dict)
+    print_received = Signal(dict)
+    worklist_changed = Signal()
 
 
 LOG_BUS = LogBus()
+
+
+# Datasets received via the built-in C-STORE SCP (kept in memory for the Data tab).
+RECEIVED_FILES: list[dict] = []
+RECEIVED_LOCK = threading.Lock()
+
+# Print jobs received via the built-in Print SCP (kept in memory for the Data tab).
+PRINT_JOBS: list[dict] = []
+PRINT_LOCK = threading.Lock()
 
 
 def _emit_log(direction: str, level: str, source: str, message: str, details: str = ""):
@@ -206,7 +223,8 @@ SOP_CLASS_FOR_MODALITY = {
     "CR": ComputedRadiographyImageStorage,
     "DX": DigitalXRayImageStorageForPresentation,
     "US": UltrasoundImageStorage,
-    "XA": XRayAngiographicImageStorage,
+    # Digital Mammography X-Ray Image Storage - For Presentation
+    "MG": "1.2.840.10008.5.1.4.1.1.1.2",
 }
 
 
@@ -223,10 +241,12 @@ def _make_pattern(width: int, height: int, modality: str) -> np.ndarray:
     elif modality == "US":
         img = ((np.sin(xx / 12.0) * np.sin(yy / 12.0) + 1) * 127).astype(np.uint8)
         img = img.astype(np.uint16)
-    else:  # XA
-        img = (np.clip(np.abs(xx - width / 2) + np.abs(yy - height / 2), 0, 4095)).astype(
-            np.uint16
-        )
+    else:  # MG (mammography) - simulate breast tissue density gradient
+        cx = width * 0.35
+        cy = height * 0.5
+        r = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+        img = np.clip(3500 - r * 12, 0, 4095).astype(np.uint16)
+        img += ((xx + yy * 3) & 0x1FF).astype(np.uint16)
     return img
 
 
@@ -320,7 +340,7 @@ PROCEDURE_DESCS = [
     "CT ABDOMEN PELVIS WITH CONTRAST", "MRI LUMBAR SPINE", "ECHOCARDIOGRAM",
     "XR CHEST PORTABLE", "DEXA SCAN", "FLUOROSCOPY UPPER GI",
 ]
-STATIONS = ["CT01", "MR01", "MR02", "CR01", "DX01", "US01", "XA01", "MG01"]
+STATIONS = ["CT01", "MR01", "MR02", "CR01", "DX01", "US01", "MG01", "MG02"]
 
 
 def _random_name() -> str:
@@ -348,7 +368,7 @@ def generate_mwl_entries(count: int = 25) -> list[dict]:
     for _ in range(count):
         delta_days = random.randint(-2, 5)
         sched_dt = today + timedelta(days=delta_days, hours=random.randint(7, 17))
-        modality = random.choice(MODALITIES + ["MG"])
+        modality = random.choice(MODALITIES)
         entries.append(
             {
                 "PatientName": _random_name(),
@@ -375,6 +395,7 @@ MWL_ENTRIES: list[dict] = []
 def init_mwl_entries():
     MWL_ENTRIES.clear()
     MWL_ENTRIES.extend(generate_mwl_entries())
+    LOG_BUS.worklist_changed.emit()
 
 
 # ---------------------------------------------------------------------------
@@ -507,20 +528,47 @@ class SCPServer:
             f"Transfer Syntax: {ds.file_meta.TransferSyntaxUID}"
         )
         log_in("SCP", f"C-STORE received from {ar.ae_title}", info, level="success")
+        record = {
+            "ts": datetime.now(),
+            "patient": str(getattr(ds, "PatientName", "")),
+            "pid": str(getattr(ds, "PatientID", "")),
+            "modality": str(getattr(ds, "Modality", "")),
+            "sop_class": str(ds.file_meta.MediaStorageSOPClassUID),
+            "sop_instance": str(ds.file_meta.MediaStorageSOPInstanceUID),
+            "from_ae": str(ar.ae_title),
+            "dataset": ds,
+        }
+        with RECEIVED_LOCK:
+            RECEIVED_FILES.append(record)
+        LOG_BUS.received.emit(record)
         return 0x0000
 
     # --- print handlers --------------------------------------------------
     def _on_n_create(self, event):
+        ar = event.assoc.requestor
         sop_class = event.request.AffectedSOPClassUID
         sop_instance = event.request.AffectedSOPInstanceUID or generate_uid()
         attrs = event.attribute_list or Dataset()
         if sop_class == BasicFilmSession:
-            self._film_sessions[sop_instance] = {"attrs": attrs}
+            self._film_sessions[sop_instance] = {
+                "attrs": attrs,
+                "from_ae": str(ar.ae_title),
+            }
             log_in("SCP/Print", f"N-CREATE Basic Film Session", self._format_dataset(attrs), level="success")
         elif sop_class == BasicFilmBox:
-            self._film_boxes[sop_instance] = {"attrs": attrs}
-            # Create child image box references in response
+            # Link film box to its film session via ReferencedFilmSessionSequence.
+            fs_uid = None
+            if "ReferencedFilmSessionSequence" in attrs and attrs.ReferencedFilmSessionSequence:
+                fs_uid = str(attrs.ReferencedFilmSessionSequence[0].ReferencedSOPInstanceUID)
             image_box_uid = generate_uid()
+            self._film_boxes[sop_instance] = {
+                "attrs": attrs,
+                "film_session_uid": fs_uid,
+                "image_box_uid": image_box_uid,
+                "image_attrs": None,
+                "from_ae": str(ar.ae_title),
+            }
+            # Create child image box references in response
             rsp = Dataset()
             rsp.update(attrs)
             ib_ref = Dataset()
@@ -535,16 +583,24 @@ class SCPServer:
 
     def _on_n_set(self, event):
         sop_class = event.request.RequestedSOPClassUID
+        sop_instance = event.request.RequestedSOPInstanceUID
         attrs = event.attribute_list or Dataset()
         details = self._format_dataset(attrs, max_keys=20)
         if sop_class in (BasicGrayscaleImageBox, BasicColorImageBox):
             log_in("SCP/Print", "N-SET Image Box (image data received)", details, level="success")
+            # Stash image-box attrs against the parent film box.
+            for fb in self._film_boxes.values():
+                if fb.get("image_box_uid") == str(sop_instance):
+                    fb["image_attrs"] = attrs
+                    break
         else:
             log_in("SCP/Print", f"N-SET on {sop_class}", details)
         return 0x0000, attrs
 
     def _on_n_action(self, event):
+        ar = event.assoc.requestor
         sop_class = event.request.RequestedSOPClassUID
+        sop_instance = str(event.request.RequestedSOPInstanceUID or "")
         action_id = event.action_type
         log_in(
             "SCP/Print",
@@ -552,6 +608,27 @@ class SCPServer:
             "Print job accepted by virtual printer.",
             level="success",
         )
+        # Build a print job record for the Data tab.
+        fb = self._film_boxes.get(sop_instance) or {}
+        fs = self._film_sessions.get(fb.get("film_session_uid"), {}) if fb else {}
+        fs_attrs = fs.get("attrs", Dataset())
+        fb_attrs = fb.get("attrs", Dataset())
+        img_attrs = fb.get("image_attrs") or Dataset()
+        record = {
+            "ts": datetime.now(),
+            "from_ae": str(ar.ae_title),
+            "medium": str(getattr(fs_attrs, "MediumType", "")),
+            "copies": str(getattr(fs_attrs, "NumberOfCopies", "")),
+            "priority": str(getattr(fs_attrs, "PrintPriority", "")),
+            "destination": str(getattr(fs_attrs, "FilmDestination", "")),
+            "film_size": str(getattr(fb_attrs, "FilmSizeID", "")),
+            "orientation": str(getattr(fb_attrs, "FilmOrientation", "")),
+            "display_format": str(getattr(fb_attrs, "ImageDisplayFormat", "")),
+            "image_attrs": img_attrs,
+        }
+        with PRINT_LOCK:
+            PRINT_JOBS.append(record)
+        LOG_BUS.print_received.emit(record)
         return 0x0000, None
 
     def _on_n_delete(self, event):
@@ -998,6 +1075,7 @@ THEMES = {
     "Black": {
         "bg": "#000000",
         "panel": "#0a0a0a",
+        "input": "#0a0a0a",
         "fg": "#e6e6e6",
         "muted": "#888",
         "accent": "#3aa0ff",
@@ -1013,6 +1091,7 @@ THEMES = {
     "Dark": {
         "bg": "#1f2126",
         "panel": "#2a2d33",
+        "input": "#2a2d33",
         "fg": "#e6e6e6",
         "muted": "#9aa0a6",
         "accent": "#5aa9ff",
@@ -1028,6 +1107,7 @@ THEMES = {
     "Light": {
         "bg": "#f4f5f7",
         "panel": "#ffffff",
+        "input": "#ffffff",
         "fg": "#1f2937",
         "muted": "#6b7280",
         "accent": "#1e6fea",
@@ -1045,10 +1125,22 @@ THEMES = {
 
 def build_qss(theme: dict) -> str:
     return f"""
-    QWidget {{
+    /* Color top-level containers explicitly. We avoid the broad
+       `QWidget {{ background-color: ... }}` rule because Qt then applies
+       it to the inner subcontrols of compound widgets (QLineEdit,
+       QComboBox, etc.), overriding the per-class rules below. */
+    QMainWindow, QDialog {{
         background-color: {theme['bg']};
+    }}
+    QMainWindow > QWidget, QStackedWidget, QStackedWidget > QWidget {{
+        background-color: {theme['bg']};
+    }}
+    QWidget {{
         color: {theme['fg']};
         font-size: 13px;
+    }}
+    QTabWidget, QTabWidget::pane {{
+        background-color: {theme['bg']};
     }}
     QGroupBox {{
         border: 1px solid {theme['border']};
@@ -1062,17 +1154,35 @@ def build_qss(theme: dict) -> str:
         left: 10px;
         padding: 0 6px;
         color: {theme['muted']};
+        background-color: {theme['panel']};
     }}
     QLineEdit, QComboBox, QSpinBox, QPlainTextEdit, QTextEdit {{
-        background-color: {theme['panel']};
+        background: {theme['input']};
+        background-color: {theme['input']};
         border: 1px solid {theme['border']};
         padding: 6px 8px;
         border-radius: 4px;
         selection-background-color: {theme['selected']};
         color: {theme['fg']};
     }}
+    QComboBox QAbstractItemView {{
+        background-color: {theme['input']};
+        selection-background-color: {theme['selected']};
+        color: {theme['fg']};
+    }}
     QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{
         border: 1px solid {theme['accent']};
+    }}
+    QSpinBox::up-button, QSpinBox::down-button {{
+        width: 0;
+        height: 0;
+        border: none;
+        background: transparent;
+    }}
+    QSpinBox::up-arrow, QSpinBox::down-arrow {{
+        image: none;
+        width: 0;
+        height: 0;
     }}
     QPushButton {{
         background-color: {theme['hover']};
@@ -1105,6 +1215,14 @@ def build_qss(theme: dict) -> str:
         background-color: {theme['bg']};
         top: -1px;
     }}
+    QTabWidget::tab-bar {{
+        top: 6px;
+        left: 0;
+    }}
+    QTabBar {{
+        background-color: {theme['bg']};
+        border: none;
+    }}
     QTabBar::tab {{
         background: {theme['panel']};
         color: {theme['muted']};
@@ -1120,8 +1238,15 @@ def build_qss(theme: dict) -> str:
         color: {theme['fg']};
         border-bottom: 1px solid {theme['bg']};
     }}
+    QTabBar::tab:disabled {{
+        background: transparent;
+        color: transparent;
+        border: none;
+        padding: 0;
+        margin: 0;
+    }}
     QTableWidget {{
-        background-color: {theme['panel']};
+        background-color: {theme['input']};
         gridline-color: {theme['border']};
         selection-background-color: {theme['selected']};
         selection-color: {theme['fg']};
@@ -1191,6 +1316,94 @@ def build_qss(theme: dict) -> str:
 # ---------------------------------------------------------------------------
 # UI helpers
 # ---------------------------------------------------------------------------
+class DateRangePopup(QDialog):
+    """Calendar-based picker that returns a date or YYYYMMDD-YYYYMMDD range."""
+
+    def __init__(self, parent=None, initial_text: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Pick scheduled date")
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        self.range_check = QCheckBox("Use date range")
+        layout.addWidget(self.range_check)
+
+        cal_row = QHBoxLayout()
+        start_box = QGroupBox("Start")
+        sl = QVBoxLayout(start_box)
+        self.start_cal = QCalendarWidget()
+        self.start_cal.setGridVisible(True)
+        sl.addWidget(self.start_cal)
+        cal_row.addWidget(start_box)
+
+        self.end_box = QGroupBox("End")
+        el = QVBoxLayout(self.end_box)
+        self.end_cal = QCalendarWidget()
+        self.end_cal.setGridVisible(True)
+        el.addWidget(self.end_cal)
+        cal_row.addWidget(self.end_box)
+        self.end_box.setVisible(False)
+        layout.addLayout(cal_row)
+
+        self.range_check.toggled.connect(self.end_box.setVisible)
+        self.range_check.toggled.connect(self._adjust_size)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel | QDialogButtonBox.Reset
+        )
+        btns.button(QDialogButtonBox.Reset).setText("Clear")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        btns.button(QDialogButtonBox.Reset).clicked.connect(self._clear)
+        layout.addWidget(btns)
+
+        self._cleared = False
+        self._parse_initial(initial_text)
+
+    def _parse_initial(self, text: str):
+        text = (text or "").strip()
+        if not text:
+            today = QDate.currentDate()
+            self.start_cal.setSelectedDate(today)
+            self.end_cal.setSelectedDate(today)
+            return
+        if "-" in text:
+            a, b = text.split("-", 1)
+            self.range_check.setChecked(True)
+            self._set_date(self.start_cal, a.strip())
+            self._set_date(self.end_cal, b.strip())
+        else:
+            self._set_date(self.start_cal, text)
+
+    @staticmethod
+    def _set_date(cal: QCalendarWidget, yyyymmdd: str):
+        try:
+            d = QDate(int(yyyymmdd[:4]), int(yyyymmdd[4:6]), int(yyyymmdd[6:8]))
+            if d.isValid():
+                cal.setSelectedDate(d)
+        except Exception:
+            cal.setSelectedDate(QDate.currentDate())
+
+    def _adjust_size(self):
+        self.adjustSize()
+
+    def _clear(self):
+        self._cleared = True
+        self.accept()
+
+    def get_value(self) -> str:
+        if self._cleared:
+            return ""
+        s = self.start_cal.selectedDate().toString("yyyyMMdd")
+        if self.range_check.isChecked():
+            e = self.end_cal.selectedDate().toString("yyyyMMdd")
+            return f"{s}-{e}"
+        return s
+
+
 def make_destination_box(default_port: int = 104) -> tuple[QGroupBox, QLineEdit, QSpinBox, QLineEdit]:
     box = QGroupBox("Destination")
     grid = QGridLayout(box)
@@ -1199,6 +1412,7 @@ def make_destination_box(default_port: int = 104) -> tuple[QGroupBox, QLineEdit,
     port = QSpinBox()
     port.setRange(1, 65535)
     port.setValue(default_port)
+    port.setButtonSymbols(QAbstractSpinBox.NoButtons)
     ae = QLineEdit()
     ae.setPlaceholderText("REMOTE_AE")
     grid.addWidget(QLabel("IP Address"), 0, 0)
@@ -1304,10 +1518,20 @@ class MWLTab(QWidget):
         self.f_station = QLineEdit()
         self.f_pn.setPlaceholderText("e.g. SMITH^*")
         self.f_date.setPlaceholderText("YYYYMMDD or YYYYMMDD-YYYYMMDD")
+
+        date_widget = QWidget()
+        dw = QHBoxLayout(date_widget)
+        dw.setContentsMargins(0, 0, 0, 0)
+        dw.setSpacing(4)
+        dw.addWidget(self.f_date, 1)
+        self.date_pick_btn = QPushButton("Pick...")
+        self.date_pick_btn.clicked.connect(self._pick_date)
+        dw.addWidget(self.date_pick_btn)
+
         grid.addWidget(QLabel("Patient Name"), 0, 0); grid.addWidget(self.f_pn, 0, 1)
         grid.addWidget(QLabel("Patient ID"), 0, 2);  grid.addWidget(self.f_pid, 0, 3)
         grid.addWidget(QLabel("Accession #"), 1, 0); grid.addWidget(self.f_acc, 1, 1)
-        grid.addWidget(QLabel("Sched. Date"), 1, 2); grid.addWidget(self.f_date, 1, 3)
+        grid.addWidget(QLabel("Sched. Date"), 1, 2); grid.addWidget(date_widget, 1, 3)
         grid.addWidget(QLabel("Modality"), 2, 0);    grid.addWidget(self.f_mod, 2, 1)
         grid.addWidget(QLabel("Sched. Station AE"), 2, 2); grid.addWidget(self.f_station, 2, 3)
         layout.addWidget(filter_box)
@@ -1331,6 +1555,11 @@ class MWLTab(QWidget):
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         layout.addWidget(self.table, 1)
+
+    def _pick_date(self):
+        dlg = DateRangePopup(self, self.f_date.text())
+        if dlg.exec() == QDialog.Accepted:
+            self.f_date.setText(dlg.get_value())
 
     def do_query(self):
         ip = self.ip.text().strip() or "127.0.0.1"
@@ -1807,6 +2036,7 @@ class SettingsTab(QWidget):
         self.port_input = QSpinBox()
         self.port_input.setRange(1, 65535)
         self.port_input.setValue(int(cfg["local_port"]))
+        self.port_input.setButtonSymbols(QAbstractSpinBox.NoButtons)
         form.addRow("Local AE Title", self.ae_input)
         form.addRow("Local Port", self.port_input)
         info = QLabel(
@@ -1828,13 +2058,10 @@ class SettingsTab(QWidget):
         layout.addWidget(theme_box)
 
         btn_row = QHBoxLayout()
-        save_btn = QPushButton("Apply & Save")
+        save_btn = QPushButton("Save")
         save_btn.setObjectName("primary")
         save_btn.clicked.connect(self.apply)
-        regen_btn = QPushButton("Regenerate Worklist Data")
-        regen_btn.clicked.connect(self.regen)
         btn_row.addWidget(save_btn)
-        btn_row.addWidget(regen_btn)
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
 
@@ -1852,9 +2079,242 @@ class SettingsTab(QWidget):
         save_config(self.cfg)
         self.on_change()
 
-    def regen(self):
+
+class DataTab(QWidget):
+    """Browse C-STORE'd files and the worklist data the SCP serves."""
+
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        title = QLabel("Data")
+        title.setObjectName("title")
+        layout.addWidget(title)
+
+        splitter = QSplitter(Qt.Vertical)
+
+        # --- Received DICOM files -----------------------------------------
+        recv_box = QGroupBox("Received DICOM files (via built-in C-STORE SCP)")
+        rl = QVBoxLayout(recv_box)
+        self.recv_table = QTableWidget(0, 6)
+        self.recv_table.setHorizontalHeaderLabels(
+            ["Time", "Patient Name", "Patient ID", "Modality", "From AE", "SOP Class"]
+        )
+        self.recv_table.horizontalHeader().setStretchLastSection(True)
+        self.recv_table.setAlternatingRowColors(True)
+        self.recv_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.recv_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.recv_table.verticalHeader().setVisible(False)
+        rl.addWidget(self.recv_table, 1)
+        recv_btns = QHBoxLayout()
+        self.save_btn = QPushButton("Save Selected to Folder...")
+        self.save_btn.clicked.connect(self.save_selected)
+        self.clear_recv_btn = QPushButton("Clear")
+        self.clear_recv_btn.clicked.connect(self.clear_received)
+        self.recv_count = QLabel("0 file(s) received")
+        self.recv_count.setObjectName("muted")
+        recv_btns.addWidget(self.save_btn)
+        recv_btns.addWidget(self.clear_recv_btn)
+        recv_btns.addStretch(1)
+        recv_btns.addWidget(self.recv_count)
+        rl.addLayout(recv_btns)
+        splitter.addWidget(recv_box)
+
+        # --- Received print jobs ------------------------------------------
+        print_box = QGroupBox("Received print jobs (via built-in Print SCP)")
+        pl = QVBoxLayout(print_box)
+        self.print_table = QTableWidget(0, 7)
+        self.print_table.setHorizontalHeaderLabels(
+            ["Time", "From AE", "Medium", "Copies", "Priority", "Film Size", "Orientation"]
+        )
+        self.print_table.horizontalHeader().setStretchLastSection(True)
+        self.print_table.setAlternatingRowColors(True)
+        self.print_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.print_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.print_table.verticalHeader().setVisible(False)
+        pl.addWidget(self.print_table, 1)
+        print_btns = QHBoxLayout()
+        self.clear_print_btn = QPushButton("Clear")
+        self.clear_print_btn.clicked.connect(self.clear_print_jobs)
+        self.print_count = QLabel("0 print job(s)")
+        self.print_count.setObjectName("muted")
+        print_btns.addWidget(self.clear_print_btn)
+        print_btns.addStretch(1)
+        print_btns.addWidget(self.print_count)
+        pl.addLayout(print_btns)
+        splitter.addWidget(print_box)
+
+        # --- Worklist data ------------------------------------------------
+        wl_box = QGroupBox("Modality Worklist data (served by built-in MWL SCP)")
+        wl = QVBoxLayout(wl_box)
+        self.wl_table = QTableWidget(0, 8)
+        self.wl_table.setHorizontalHeaderLabels(
+            ["Patient Name", "Patient ID", "Accession #", "Date", "Time", "Modality", "Station AE", "Procedure"]
+        )
+        self.wl_table.horizontalHeader().setStretchLastSection(True)
+        self.wl_table.setAlternatingRowColors(True)
+        self.wl_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.wl_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.wl_table.verticalHeader().setVisible(False)
+        wl.addWidget(self.wl_table, 1)
+        wl_btns = QHBoxLayout()
+        self.regen_btn = QPushButton("Regenerate Worklist Data")
+        self.regen_btn.setObjectName("primary")
+        self.regen_btn.clicked.connect(self.regenerate)
+        self.wl_count = QLabel("0 entries")
+        self.wl_count.setObjectName("muted")
+        wl_btns.addWidget(self.regen_btn)
+        wl_btns.addStretch(1)
+        wl_btns.addWidget(self.wl_count)
+        wl.addLayout(wl_btns)
+        splitter.addWidget(wl_box)
+
+        splitter.setSizes([260, 220, 260])
+        layout.addWidget(splitter, 1)
+
+        LOG_BUS.received.connect(self._on_received)
+        LOG_BUS.print_received.connect(self._on_print_received)
+        LOG_BUS.worklist_changed.connect(self.refresh_worklist)
+        self.refresh_received()
+        self.refresh_print_jobs()
+        self.refresh_worklist()
+
+    @Slot(dict)
+    def _on_received(self, _record: dict):
+        self.refresh_received()
+
+    @Slot(dict)
+    def _on_print_received(self, _record: dict):
+        self.refresh_print_jobs()
+
+    def refresh_print_jobs(self):
+        with PRINT_LOCK:
+            jobs = list(PRINT_JOBS)
+        self.print_table.setRowCount(0)
+        for j in jobs:
+            row = self.print_table.rowCount()
+            self.print_table.insertRow(row)
+            self.print_table.setItem(row, 0, QTableWidgetItem(j["ts"].strftime("%Y-%m-%d %H:%M:%S")))
+            self.print_table.setItem(row, 1, QTableWidgetItem(j["from_ae"]))
+            self.print_table.setItem(row, 2, QTableWidgetItem(j["medium"]))
+            self.print_table.setItem(row, 3, QTableWidgetItem(j["copies"]))
+            self.print_table.setItem(row, 4, QTableWidgetItem(j["priority"]))
+            self.print_table.setItem(row, 5, QTableWidgetItem(j["film_size"]))
+            self.print_table.setItem(row, 6, QTableWidgetItem(j["orientation"]))
+        self.print_count.setText(f"{len(jobs)} print job(s)")
+
+    def clear_print_jobs(self):
+        with PRINT_LOCK:
+            PRINT_JOBS.clear()
+        self.refresh_print_jobs()
+
+    def refresh_received(self):
+        with RECEIVED_LOCK:
+            rows = list(RECEIVED_FILES)
+        self.recv_table.setRowCount(0)
+        for r in rows:
+            row = self.recv_table.rowCount()
+            self.recv_table.insertRow(row)
+            self.recv_table.setItem(row, 0, QTableWidgetItem(r["ts"].strftime("%Y-%m-%d %H:%M:%S")))
+            self.recv_table.setItem(row, 1, QTableWidgetItem(r["patient"]))
+            self.recv_table.setItem(row, 2, QTableWidgetItem(r["pid"]))
+            self.recv_table.setItem(row, 3, QTableWidgetItem(r["modality"]))
+            self.recv_table.setItem(row, 4, QTableWidgetItem(r["from_ae"]))
+            self.recv_table.setItem(row, 5, QTableWidgetItem(r["sop_class"]))
+        self.recv_count.setText(f"{len(rows)} file(s) received")
+
+    def refresh_worklist(self):
+        self.wl_table.setRowCount(0)
+        for e in MWL_ENTRIES:
+            row = self.wl_table.rowCount()
+            self.wl_table.insertRow(row)
+            self.wl_table.setItem(row, 0, QTableWidgetItem(e["PatientName"]))
+            self.wl_table.setItem(row, 1, QTableWidgetItem(e["PatientID"]))
+            self.wl_table.setItem(row, 2, QTableWidgetItem(e["AccessionNumber"]))
+            self.wl_table.setItem(row, 3, QTableWidgetItem(e["ScheduledProcedureStepStartDate"]))
+            self.wl_table.setItem(row, 4, QTableWidgetItem(e["ScheduledProcedureStepStartTime"]))
+            self.wl_table.setItem(row, 5, QTableWidgetItem(e["Modality"]))
+            self.wl_table.setItem(row, 6, QTableWidgetItem(e["ScheduledStationAETitle"]))
+            self.wl_table.setItem(row, 7, QTableWidgetItem(e["ScheduledProcedureStepDescription"]))
+        self.wl_count.setText(f"{len(MWL_ENTRIES)} entries")
+
+    def regenerate(self):
         init_mwl_entries()
-        log_system("Settings", f"Regenerated {len(MWL_ENTRIES)} dummy worklist entries", level="success")
+        log_system(
+            "Data",
+            f"Regenerated {len(MWL_ENTRIES)} dummy worklist entries",
+            level="success",
+        )
+
+    def clear_received(self):
+        with RECEIVED_LOCK:
+            RECEIVED_FILES.clear()
+        self.refresh_received()
+
+    def save_selected(self):
+        rows = sorted({i.row() for i in self.recv_table.selectedIndexes()})
+        if not rows:
+            QMessageBox.information(self, APP_NAME, "Select one or more rows to save.")
+            return
+        target = QFileDialog.getExistingDirectory(self, "Save received DICOM files to...")
+        if not target:
+            return
+        with RECEIVED_LOCK:
+            snapshot = list(RECEIVED_FILES)
+        saved = 0
+        errors: list[str] = []
+        for idx in rows:
+            if idx >= len(snapshot):
+                continue
+            rec = snapshot[idx]
+            ds: Dataset = rec["dataset"]
+            stem = (rec["sop_instance"] or generate_uid())[-32:]
+            path = Path(target) / f"{stem}.dcm"
+            try:
+                ds.save_as(str(path), write_like_original=False)
+                saved += 1
+            except Exception as exc:
+                errors.append(f"{stem}: {exc}")
+        msg = f"Saved {saved}/{len(rows)} file(s) to {target}"
+        if errors:
+            msg += "\n\nErrors:\n" + "\n".join(errors)
+        QMessageBox.information(self, APP_NAME, msg)
+
+
+# ---------------------------------------------------------------------------
+# Tab bar that right-aligns a trailing group of tabs via an invisible spacer.
+# ---------------------------------------------------------------------------
+class GroupedTabBar(QTabBar):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._spacer_index = -1
+
+    def set_spacer_index(self, idx: int):
+        self._spacer_index = idx
+
+    def tabSizeHint(self, index):
+        if index == self._spacer_index and self._spacer_index >= 0 and self.count() > 1:
+            available = self.parent().width() if self.parent() else self.width()
+            others = 0
+            base_h = 30
+            for i in range(self.count()):
+                if i == self._spacer_index:
+                    continue
+                s = super().tabSizeHint(i)
+                others += s.width()
+                if s.height() > base_h:
+                    base_h = s.height()
+            return QSize(max(0, available - others - 8), base_h)
+        return super().tabSizeHint(index)
+
+    def mousePressEvent(self, event):
+        idx = self.tabAt(event.pos())
+        if idx == self._spacer_index:
+            event.ignore()
+            return
+        super().mousePressEvent(event)
 
 
 # ---------------------------------------------------------------------------
@@ -1868,12 +2328,15 @@ class MainWindow(QMainWindow):
         self.resize(1100, 760)
 
         self.tabs = QTabWidget()
+        self._tab_bar = GroupedTabBar()
+        self.tabs.setTabBar(self._tab_bar)
         get_local = lambda: self.cfg
         get_theme = lambda: THEMES[self.cfg["theme"]]
         self.echo_tab = EchoTab(get_local)
         self.mwl_tab = MWLTab(get_local)
         self.send_tab = SendTab(get_local)
         self.print_tab = PrintTab(get_local)
+        self.data_tab = DataTab()
         self.logs_tab = LogsTab(get_theme)
         self.settings_tab = SettingsTab(self.cfg, self.apply_settings)
 
@@ -1881,8 +2344,18 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.mwl_tab, "Modality Worklist")
         self.tabs.addTab(self.send_tab, "Send DICOM")
         self.tabs.addTab(self.print_tab, "Print")
+        # Invisible disabled spacer tab pushes the following tabs to the right.
+        spacer_idx = self.tabs.addTab(QWidget(), "")
+        self.tabs.setTabEnabled(spacer_idx, False)
+        self._tab_bar.set_spacer_index(spacer_idx)
+        self.tabs.addTab(self.data_tab, "Data")
         self.tabs.addTab(self.logs_tab, "Logs")
         self.tabs.addTab(self.settings_tab, "Settings")
+
+        # Top padding above the tab bar comes from QSS rule
+        # `QTabWidget::tab-bar { top: 6px }`, so the tab widget can be the
+        # central widget directly without an extra wrapper (which previously
+        # caused a thin highlighted line between the title bar and the tabs).
         self.setCentralWidget(self.tabs)
 
         self.status = QStatusBar()
@@ -1901,7 +2374,27 @@ class MainWindow(QMainWindow):
 
     def apply_theme(self):
         theme = THEMES[self.cfg["theme"]]
-        QApplication.instance().setStyleSheet(build_qss(theme))
+        app = QApplication.instance()
+        # Set a palette so Fusion paints input widgets (which use Base) and
+        # the table cell background using our theme colors. QSS alone does
+        # not always override Fusion's hard-coded Base color.
+        pal = QPalette()
+        pal.setColor(QPalette.Window, QColor(theme["bg"]))
+        pal.setColor(QPalette.WindowText, QColor(theme["fg"]))
+        pal.setColor(QPalette.Base, QColor(theme["input"]))
+        pal.setColor(QPalette.AlternateBase, QColor(theme["hover"]))
+        pal.setColor(QPalette.Text, QColor(theme["fg"]))
+        pal.setColor(QPalette.Button, QColor(theme["hover"]))
+        pal.setColor(QPalette.ButtonText, QColor(theme["fg"]))
+        pal.setColor(QPalette.Highlight, QColor(theme["selected"]))
+        pal.setColor(QPalette.HighlightedText, QColor(theme["fg"]))
+        pal.setColor(QPalette.ToolTipBase, QColor(theme["panel"]))
+        pal.setColor(QPalette.ToolTipText, QColor(theme["fg"]))
+        pal.setColor(QPalette.PlaceholderText, QColor(theme["muted"]))
+        pal.setColor(QPalette.BrightText, QColor(theme["fg"]))
+        pal.setColor(QPalette.Link, QColor(theme["accent"]))
+        app.setPalette(pal)
+        app.setStyleSheet(build_qss(theme))
 
     def _update_status(self):
         self._scp_label.setText(
@@ -1923,8 +2416,12 @@ def main():
 
     cfg = load_config()
     app = QApplication(sys.argv)
+    # Fusion is consistent across platforms and respects QSS background rules
+    # on input widgets (the native Windows style does not).
+    app.setStyle("Fusion")
     app.setApplicationName(APP_NAME)
-    app.setApplicationDisplayName(APP_NAME)
+    # Do not call setApplicationDisplayName — Qt would auto-append it to
+    # every window title (producing "[dicom.flux] v1.0.0 - [dicom.flux]").
     app.setOrganizationName(APP_NAME)
 
     win = MainWindow(cfg)
