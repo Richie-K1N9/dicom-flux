@@ -9,8 +9,10 @@ import os
 import platform
 import random
 import re
+import shutil
 import socket
 import string
+import subprocess
 import sys
 import tempfile
 import threading
@@ -57,8 +59,8 @@ from pynetdicom.sop_class import (
     Printer,
 )
 
-from PySide6.QtCore import Qt, QObject, Signal, QThread, QTimer, Slot, QSize, QDate
-from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QBrush, QAction, QPalette, QKeySequence
+from PySide6.QtCore import Qt, QObject, QRect, Signal, QThread, QTimer, Slot, QSize, QDate
+from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPixmap, QPainter, QBrush, QAction, QPalette, QKeySequence
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
@@ -93,6 +95,10 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QCalendarWidget,
     QMenu,
+    QScrollArea,
+    QSizePolicy,
+    QSlider,
+    QToolButton,
 )
 
 APP_NAME = "[dicom.flux]"
@@ -108,6 +114,7 @@ DEFAULT_CONFIG = {
     "local_ae": "DICOMFLUX",
     "local_port": 11112,
     "theme": "Dark",
+    "weasis_path": "",
 }
 
 MEDIUM_TYPES = [
@@ -192,6 +199,14 @@ def load_config() -> dict:
 def save_config(cfg: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+# Session-scoped temp directory for files written to disk (e.g. for Weasis).
+# Placed under the OS temp folder so the OS naturally reclaims it; we also
+# register an atexit handler so it's removed cleanly on normal exit.
+import atexit as _atexit
+_TEMP_DIR = Path(tempfile.mkdtemp(prefix="dicom_flux_"))
+_atexit.register(shutil.rmtree, str(_TEMP_DIR), True)
 
 
 # ---------------------------------------------------------------------------
@@ -1300,28 +1315,36 @@ def scu_print(
 
         # 3. N-SET Basic Grayscale Image Box
         # Build a "preformatted grayscale image" dataset from the source image.
+        # Use add_new() with explicit tags for print-specific attributes —
+        # pydicom's keyword dictionary has collisions ("ImagePosition" maps to
+        # the retired (0020,0030)) and lacks an entry for
+        # PreformattedGrayscaleImageSequence (2020,0110), so keyword access
+        # would either route to the wrong tag or silently drop the value.
         if "PixelData" not in dataset:
             return False, "Selected dataset has no pixel data to print", ""
 
+        bits_alloc = int(dataset.BitsAllocated)
+        pd_vr = "OW" if bits_alloc > 8 else "OB"
+
         img_seq = Dataset()
-        img_seq.SamplesPerPixel = getattr(dataset, "SamplesPerPixel", 1)
-        img_seq.PhotometricInterpretation = getattr(
-            dataset, "PhotometricInterpretation", "MONOCHROME2"
+        img_seq.SamplesPerPixel = int(getattr(dataset, "SamplesPerPixel", 1))
+        img_seq.PhotometricInterpretation = str(
+            getattr(dataset, "PhotometricInterpretation", "MONOCHROME2")
         )
-        img_seq.Rows = dataset.Rows
-        img_seq.Columns = dataset.Columns
-        img_seq.BitsAllocated = dataset.BitsAllocated
-        img_seq.BitsStored = dataset.BitsStored
-        img_seq.HighBit = dataset.HighBit
-        img_seq.PixelRepresentation = getattr(dataset, "PixelRepresentation", 0)
-        img_seq.PixelData = dataset.PixelData
+        img_seq.Rows = int(dataset.Rows)
+        img_seq.Columns = int(dataset.Columns)
+        img_seq.BitsAllocated = bits_alloc
+        img_seq.BitsStored = int(dataset.BitsStored)
+        img_seq.HighBit = int(dataset.HighBit)
+        img_seq.PixelRepresentation = int(getattr(dataset, "PixelRepresentation", 0))
+        img_seq.add_new((0x7FE0, 0x0010), pd_vr, dataset.PixelData)
 
         ib_attrs = Dataset()
-        ib_attrs.ImagePosition = 1
-        ib_attrs.Polarity = "NORMAL"
-        ib_attrs.MagnificationType = "REPLICATE"
-        ib_attrs.SmoothingType = "MEDIUM"
-        ib_attrs.PreformattedGrayscaleImageSequence = [img_seq]
+        ib_attrs.add_new((0x2020, 0x0010), "US", 1)               # ImagePosition (Image Box)
+        ib_attrs.add_new((0x2020, 0x0020), "CS", "NORMAL")        # Polarity
+        ib_attrs.add_new((0x2010, 0x0060), "CS", "REPLICATE")     # MagnificationType
+        ib_attrs.add_new((0x2010, 0x0080), "CS", "MEDIUM")        # SmoothingType
+        ib_attrs.add_new((0x2020, 0x0110), "SQ", [img_seq])       # PreformattedGrayscaleImageSequence
         status, _ = assoc.send_n_set(
             ib_attrs,
             BasicGrayscaleImageBox,
@@ -1480,6 +1503,10 @@ def build_qss(theme: dict) -> str:
         color: {theme['muted']};
         background-color: {theme['panel']};
     }}
+    QGroupBox[dragHover="true"] {{
+        border: 1px dashed {theme['accent']};
+        background-color: {theme['hover']};
+    }}
     QLineEdit, QComboBox, QSpinBox, QPlainTextEdit, QTextEdit {{
         background: {theme['input']};
         background-color: {theme['input']};
@@ -1552,6 +1579,25 @@ def build_qss(theme: dict) -> str:
     }}
     QPushButton:disabled {{
         color: {theme['muted']};
+    }}
+    QPushButton#iconBtn {{
+        padding: 4px 6px;
+        min-width: 0;
+        font-weight: bold;
+    }}
+    QLabel:disabled,
+    QComboBox:disabled,
+    QLineEdit:disabled,
+    QSpinBox:disabled,
+    QPlainTextEdit:disabled,
+    QTextEdit:disabled {{
+        color: {theme['muted']};
+    }}
+    QComboBox:disabled,
+    QLineEdit:disabled,
+    QSpinBox:disabled {{
+        background-color: {theme['bg']};
+        border-color: {theme['border']};
     }}
     QPushButton#primary {{
         background-color: {theme['accent']};
@@ -1991,6 +2037,62 @@ class MWLTab(QWidget):
                     self.table.setItem(r, c, QTableWidgetItem(str(row.get(key, ""))))
 
 
+class _FileDropGroupBox(QGroupBox):
+    """QGroupBox that accepts drag-and-drop of files matching given extensions.
+
+    Emits ``file_dropped(path)`` for the first matching file. Visual feedback
+    (dashed accent border) is driven via the ``dragHover`` dynamic property,
+    styled by the global QSS."""
+
+    file_dropped = Signal(str)
+
+    def __init__(self, title: str, extensions: tuple, parent=None):
+        super().__init__(title, parent)
+        self._exts = tuple(e.lower() for e in extensions)
+        self.setAcceptDrops(True)
+
+    def _first_matching(self, event):
+        if not event.mimeData().hasUrls():
+            return None
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                p = url.toLocalFile()
+                if p.lower().endswith(self._exts):
+                    return p
+        return None
+
+    def _set_hover(self, on: bool):
+        self.setProperty("dragHover", on)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def dragEnterEvent(self, event):
+        if self._first_matching(event):
+            event.acceptProposedAction()
+            self._set_hover(True)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._first_matching(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._set_hover(False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        path = self._first_matching(event)
+        self._set_hover(False)
+        if path:
+            self.file_dropped.emit(path)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
 class SendTab(QWidget):
     def __init__(self, get_local):
         super().__init__()
@@ -2010,19 +2112,42 @@ class SendTab(QWidget):
         dest, self.ip, self.port, self.ae = make_destination_box(104)
         layout.addWidget(dest)
 
-        src_box = QGroupBox("Source")
-        sl = QGridLayout(src_box)
-        sl.addWidget(QLabel("Built-in sample"), 0, 0)
+        src_box = _FileDropGroupBox("Source  (drop a .dcm or .zip here)", (".dcm", ".zip"))
+        src_box.file_dropped.connect(self._load_uploaded)
+        sl = QHBoxLayout(src_box)
+        sl.setSpacing(8)
+        # Wrap label + combo so setEnabled(False) greys both together
+        self._sample_widget = QWidget()
+        self._sample_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        sw = QHBoxLayout(self._sample_widget)
+        sw.setContentsMargins(0, 0, 0, 0)
+        sw.setSpacing(6)
+        sw.addWidget(QLabel("Built-in sample"))
         self.modality_combo = FlatComboBox()
         self.modality_combo.addItems(MODALITIES)
-        sl.addWidget(self.modality_combo, 0, 1)
-        self.upload_btn = QPushButton("Upload .dcm or .zip...")
+        sw.addWidget(self.modality_combo, stretch=1)
+        sl.addWidget(self._sample_widget, stretch=1)
+        # Separator — only visible when a file is uploaded
+        self._src_sep = QFrame()
+        self._src_sep.setFrameShape(QFrame.VLine)
+        self._src_sep.setFrameShadow(QFrame.Plain)
+        self._src_sep.setFixedWidth(12)
+        self._src_sep.setVisible(False)
+        sl.addWidget(self._src_sep)
+        # Uploaded file name label
+        self.upload_label = QLabel()
+        self.upload_label.setVisible(False)
+        sl.addWidget(self.upload_label, stretch=1)
+        # Clear button
+        self.clear_upload_btn = QPushButton("X")
+        self.clear_upload_btn.setObjectName("iconBtn")
+        self.clear_upload_btn.setToolTip("Remove uploaded file")
+        self.clear_upload_btn.clicked.connect(self.clear_uploads)
+        self.clear_upload_btn.setVisible(False)
+        sl.addWidget(self.clear_upload_btn)
+        self.upload_btn = QPushButton("Upload .dcm / .zip…")
         self.upload_btn.clicked.connect(self.pick_files)
-        sl.addWidget(self.upload_btn, 0, 2)
-        self.upload_label = QLabel("(no files uploaded - using sample)")
-        self.upload_label.setObjectName("muted")
-        sl.addWidget(self.upload_label, 1, 0, 1, 3)
-        sl.setColumnStretch(1, 1)
+        sl.addWidget(self.upload_btn)
         layout.addWidget(src_box)
 
         btn_row = QHBoxLayout()
@@ -2043,20 +2168,34 @@ class SendTab(QWidget):
         rg_layout.addWidget(self.details)
         layout.addWidget(result_group, 1)
 
+    def _update_source_ui(self, has_file: bool, text: str = "", ok: bool = True):
+        self._sample_widget.setEnabled(not has_file)
+        self._sample_widget.setSizePolicy(
+            QSizePolicy.Preferred if has_file else QSizePolicy.Expanding,
+            QSizePolicy.Preferred,
+        )
+        self._src_sep.setVisible(has_file)
+        self.upload_label.setText(text)
+        self.upload_label.setObjectName("status-ok" if ok else "status-err")
+        self.upload_label.setVisible(has_file)
+        self.clear_upload_btn.setVisible(has_file)
+        self.upload_label.style().polish(self.upload_label)
+
+    def _load_uploaded(self, path: str):
+        self._uploaded = self._load_path(path)
+        p = Path(path)
+        if self._uploaded:
+            self._update_source_ui(True, f"{p.name}  ({len(self._uploaded)} dataset(s))", ok=True)
+        else:
+            self._update_source_ui(True, f"Could not load: {p.name}", ok=False)
+
     def pick_files(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select DICOM file or ZIP", "", "DICOM/ZIP (*.dcm *.zip);;All Files (*)"
         )
         if not path:
             return
-        self._uploaded = self._load_path(path)
-        if self._uploaded:
-            self.upload_label.setText(f"Uploaded {len(self._uploaded)} dataset(s) from {Path(path).name}")
-            self.upload_label.setObjectName("status-ok")
-        else:
-            self.upload_label.setText(f"Could not load any DICOM files from {Path(path).name}")
-            self.upload_label.setObjectName("status-err")
-        self.upload_label.style().polish(self.upload_label)
+        self._load_uploaded(path)
 
     @staticmethod
     def _load_path(path: str) -> list[Dataset]:
@@ -2085,9 +2224,7 @@ class SendTab(QWidget):
 
     def clear_uploads(self):
         self._uploaded = []
-        self.upload_label.setText("(no files uploaded - using sample)")
-        self.upload_label.setObjectName("muted")
-        self.upload_label.style().polish(self.upload_label)
+        self._update_source_ui(False)
 
     def do_send(self):
         ip = self.ip.text().strip() or "127.0.0.1"
@@ -2151,19 +2288,38 @@ class PrintTab(QWidget):
         ml.setColumnStretch(2, 1)
         layout.addWidget(media_box)
 
-        src_box = QGroupBox("Source")
-        sl = QGridLayout(src_box)
-        sl.addWidget(QLabel("Built-in sample"), 0, 0)
+        src_box = _FileDropGroupBox("Source  (drop a .dcm here)", (".dcm",))
+        src_box.file_dropped.connect(self._load_uploaded)
+        sl = QHBoxLayout(src_box)
+        sl.setSpacing(8)
+        self._sample_widget = QWidget()
+        self._sample_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        sw = QHBoxLayout(self._sample_widget)
+        sw.setContentsMargins(0, 0, 0, 0)
+        sw.setSpacing(6)
+        sw.addWidget(QLabel("Built-in sample"))
         self.modality_combo = FlatComboBox()
         self.modality_combo.addItems(MODALITIES)
-        sl.addWidget(self.modality_combo, 0, 1)
-        self.upload_btn = QPushButton("Upload .dcm...")
+        sw.addWidget(self.modality_combo, stretch=1)
+        sl.addWidget(self._sample_widget, stretch=1)
+        self._src_sep = QFrame()
+        self._src_sep.setFrameShape(QFrame.VLine)
+        self._src_sep.setFrameShadow(QFrame.Plain)
+        self._src_sep.setFixedWidth(12)
+        self._src_sep.setVisible(False)
+        sl.addWidget(self._src_sep)
+        self.upload_label = QLabel()
+        self.upload_label.setVisible(False)
+        sl.addWidget(self.upload_label, stretch=1)
+        self.clear_upload_btn = QPushButton("X")
+        self.clear_upload_btn.setObjectName("iconBtn")
+        self.clear_upload_btn.setToolTip("Remove uploaded file")
+        self.clear_upload_btn.clicked.connect(self.clear_upload)
+        self.clear_upload_btn.setVisible(False)
+        sl.addWidget(self.clear_upload_btn)
+        self.upload_btn = QPushButton("Upload .dcm…")
         self.upload_btn.clicked.connect(self.pick_file)
-        sl.addWidget(self.upload_btn, 0, 2)
-        self.upload_label = QLabel("(no file uploaded - using sample)")
-        self.upload_label.setObjectName("muted")
-        sl.addWidget(self.upload_label, 1, 0, 1, 3)
-        sl.setColumnStretch(1, 1)
+        sl.addWidget(self.upload_btn)
         layout.addWidget(src_box)
 
         btn_row = QHBoxLayout()
@@ -2184,21 +2340,39 @@ class PrintTab(QWidget):
         rg_layout.addWidget(self.details)
         layout.addWidget(result_group, 1)
 
+    def _update_source_ui(self, has_file: bool, text: str = "", ok: bool = True):
+        self._sample_widget.setEnabled(not has_file)
+        self._sample_widget.setSizePolicy(
+            QSizePolicy.Preferred if has_file else QSizePolicy.Expanding,
+            QSizePolicy.Preferred,
+        )
+        self._src_sep.setVisible(has_file)
+        self.upload_label.setText(text)
+        self.upload_label.setObjectName("status-ok" if ok else "status-err")
+        self.upload_label.setVisible(has_file)
+        self.clear_upload_btn.setVisible(has_file)
+        self.upload_label.style().polish(self.upload_label)
+
+    def _load_uploaded(self, path: str):
+        try:
+            ds = pydicom.dcmread(path, force=True)
+            self._uploaded = [ds]
+            self._update_source_ui(True, Path(path).name, ok=True)
+        except Exception as exc:
+            self._uploaded = []
+            self._update_source_ui(True, f"Failed to load: {exc}", ok=False)
+
     def pick_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select DICOM file", "", "DICOM (*.dcm);;All Files (*)"
         )
         if not path:
             return
-        try:
-            ds = pydicom.dcmread(path, force=True)
-            self._uploaded = [ds]
-            self.upload_label.setText(f"Uploaded: {Path(path).name}")
-            self.upload_label.setObjectName("status-ok")
-        except Exception as exc:
-            self.upload_label.setText(f"Failed to load: {exc}")
-            self.upload_label.setObjectName("status-err")
-        self.upload_label.style().polish(self.upload_label)
+        self._load_uploaded(path)
+
+    def clear_upload(self):
+        self._uploaded = []
+        self._update_source_ui(False)
 
     def do_query(self):
         ip = self.ip.text().strip() or "127.0.0.1"
@@ -2585,6 +2759,28 @@ class SettingsTab(QWidget):
         tform.addRow("Theme", self.theme_combo)
         layout.addWidget(theme_box)
 
+        weasis_box = QGroupBox("External viewer")
+        wform = QFormLayout(weasis_box)
+        weasis_row = QHBoxLayout()
+        self.weasis_input = QLineEdit(cfg.get("weasis_path", ""))
+        self.weasis_input.setPlaceholderText("Path to weasis.exe / weasis-portable.exe …")
+        browse_btn = QToolButton()
+        browse_btn.setText("…")
+        browse_btn.clicked.connect(self._browse_weasis)
+        weasis_row.addWidget(self.weasis_input, stretch=1)
+        weasis_row.addWidget(browse_btn)
+        wform.addRow("Weasis executable", weasis_row)
+        weasis_info = QLabel(
+            "When set, a <i>Open in Weasis</i> button appears in the DICOM viewer. "
+            "Weasis Portable is available at <a href='https://github.com/nroduit/Weasis'>github.com/nroduit/Weasis</a>."
+        )
+        weasis_info.setObjectName("muted")
+        weasis_info.setWordWrap(True)
+        weasis_info.setTextFormat(Qt.RichText)
+        weasis_info.setOpenExternalLinks(True)
+        wform.addRow(weasis_info)
+        layout.addWidget(weasis_box)
+
         btn_row = QHBoxLayout()
         save_btn = QPushButton("Save")
         save_btn.setObjectName("primary")
@@ -2658,19 +2854,608 @@ class SettingsTab(QWidget):
         a_layout.addWidget(info)
         return about
 
+    def _browse_weasis(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Weasis executable",
+            str(Path(self.weasis_input.text()).parent) if self.weasis_input.text() else "",
+            "Executable (*.exe);;All files (*)" if sys.platform.startswith("win") else "All files (*)",
+        )
+        if path:
+            self.weasis_input.setText(path)
+
     def apply(self):
         self.cfg["local_ae"] = self.ae_input.text().strip().upper() or "DICOMFLUX"
         self.cfg["local_port"] = int(self.port_input.value())
         self.cfg["theme"] = self.theme_combo.currentText()
+        self.cfg["weasis_path"] = self.weasis_input.text().strip()
         save_config(self.cfg)
         self.on_change()
 
 
+# ---------------------------------------------------------------------------
+# DICOM viewer helpers
+# ---------------------------------------------------------------------------
+
+def _ds_to_qpixmap(
+    ds,
+    frame_idx: int = 0,
+    wl: Optional[float] = None,
+    ww: Optional[float] = None,
+) -> Optional["QPixmap"]:
+    """Render one frame of a pydicom Dataset as a QPixmap.
+
+    Applies RescaleSlope/Intercept, MONOCHROME1 inversion, and W/L windowing.
+    Returns None if pixel data is unavailable or the transfer syntax is
+    unsupported."""
+    # pydicom 3.x requires file_meta.TransferSyntaxUID to decode pixel_array.
+    # Print Management N-SET attribute lists arrive without file_meta, so set
+    # a default Implicit VR Little Endian transfer syntax (the print SOPs use
+    # this by default).
+    try:
+        if not getattr(ds, "file_meta", None) or "TransferSyntaxUID" not in ds.file_meta:
+            fm = FileMetaDataset()
+            fm.TransferSyntaxUID = ImplicitVRLittleEndian
+            ds.file_meta = fm
+            print(f"[ds_to_qpixmap] injected default TransferSyntaxUID={ImplicitVRLittleEndian}", flush=True)
+    except Exception as exc:
+        print(f"[ds_to_qpixmap] could not set file_meta: {exc}", flush=True)
+
+    arr = None
+    try:
+        arr = ds.pixel_array
+        print(f"[ds_to_qpixmap] pixel_array OK: shape={arr.shape} dtype={arr.dtype}", flush=True)
+    except Exception as exc:
+        print(f"[ds_to_qpixmap] pixel_array failed ({type(exc).__name__}: {exc}); trying manual decode", flush=True)
+        # Fallback: manually decode raw pixel bytes for uncompressed data.
+        try:
+            rows = int(getattr(ds, "Rows", 0) or 0)
+            cols = int(getattr(ds, "Columns", 0) or 0)
+            samples = int(getattr(ds, "SamplesPerPixel", 1) or 1)
+            bits = int(getattr(ds, "BitsAllocated", 8) or 8)
+            signed = int(getattr(ds, "PixelRepresentation", 0) or 0) == 1
+            pixel_bytes = ds.get((0x7FE0, 0x0010))
+            pixel_bytes = pixel_bytes.value if pixel_bytes is not None else None
+            print(f"[ds_to_qpixmap] manual decode params: rows={rows} cols={cols} "
+                  f"samples={samples} bits={bits} signed={signed} "
+                  f"px_bytes_len={len(pixel_bytes) if pixel_bytes else 0}", flush=True)
+            if not (rows and cols and pixel_bytes):
+                print("[ds_to_qpixmap] manual decode aborted: missing required field(s)", flush=True)
+                return None
+            if bits == 8:
+                dtype = np.int8 if signed else np.uint8
+            elif bits == 16:
+                dtype = np.int16 if signed else np.uint16
+            else:
+                print(f"[ds_to_qpixmap] manual decode aborted: unsupported BitsAllocated={bits}", flush=True)
+                return None
+            arr = np.frombuffer(pixel_bytes, dtype=dtype)
+            if samples == 1:
+                arr = arr.reshape(rows, cols)
+            else:
+                arr = arr.reshape(rows, cols, samples)
+            print(f"[ds_to_qpixmap] manual decode OK: shape={arr.shape} dtype={arr.dtype}", flush=True)
+        except Exception as exc2:
+            print(f"[ds_to_qpixmap] manual decode failed: {type(exc2).__name__}: {exc2}", flush=True)
+            return None
+    if arr is None:
+        print("[ds_to_qpixmap] arr is None after all paths", flush=True)
+        return None
+
+    slope = float(getattr(ds, "RescaleSlope", 1) or 1)
+    intercept = float(getattr(ds, "RescaleIntercept", 0) or 0)
+    if slope != 1.0 or intercept != 0.0:
+        arr = arr.astype(np.float32) * slope + intercept
+
+    samples = int(getattr(ds, "SamplesPerPixel", 1) or 1)
+    pi = str(getattr(ds, "PhotometricInterpretation", "MONOCHROME2")).strip()
+
+    # Extract the correct frame
+    if arr.ndim == 2:
+        frame = arr
+    elif arr.ndim == 3:
+        frame = arr if samples == 3 else arr[min(frame_idx, arr.shape[0] - 1)]
+    elif arr.ndim == 4:
+        frame = arr[min(frame_idx, arr.shape[0] - 1)]
+    else:
+        return None
+
+    if samples == 3:
+        img = np.ascontiguousarray(frame.astype(np.uint8))
+        h, w = img.shape[:2]
+        qimg = QImage(img.data, w, h, w * 3, QImage.Format_RGB888)
+        _ds_to_qpixmap._buf = img  # keep alive
+    else:
+        fa = frame.astype(np.float32)
+
+        def _auto_wl_from_range() -> tuple[float, float]:
+            # Centre the window on the midpoint of the actual pixel range so
+            # min→0 and max→255. Using fa.mean() instead of (min+max)/2 would
+            # bias the window toward the histogram peak (e.g. air in CT) and
+            # leave the rest washed out.
+            mn = float(fa.min())
+            mx = float(fa.max())
+            return (mn + mx) / 2.0, (mx - mn) or 1.0
+
+        if wl is None or ww is None:
+            wc_tag = getattr(ds, "WindowCenter", None)
+            ww_tag = getattr(ds, "WindowWidth", None)
+            if wc_tag is not None and ww_tag is not None:
+                try:
+                    wl_v = float(wc_tag) if not hasattr(wc_tag, "__iter__") else float(next(iter(wc_tag)))
+                    ww_v = float(ww_tag) if not hasattr(ww_tag, "__iter__") else float(next(iter(ww_tag)))
+                except Exception:
+                    wl_v, ww_v = _auto_wl_from_range()
+            else:
+                wl_v, ww_v = _auto_wl_from_range()
+        else:
+            wl_v, ww_v = wl, ww
+        lo = wl_v - ww_v / 2
+        hi = wl_v + ww_v / 2
+        fa = np.clip(fa, lo, hi)
+        fa = (fa - lo) / (hi - lo) * 255.0
+        if pi == "MONOCHROME1":
+            fa = 255.0 - fa
+        img = np.ascontiguousarray(fa.astype(np.uint8))
+        h, w = img.shape
+        qimg = QImage(img.data, w, h, w, QImage.Format_Grayscale8)
+        _ds_to_qpixmap._buf = img  # keep alive
+    return QPixmap.fromImage(qimg)
+
+
+_ds_to_qpixmap._buf = None  # module-level buffer reference
+
+
+def _count_frames(ds) -> int:
+    """Return the number of frames in a dataset (1 for single-frame)."""
+    try:
+        arr = ds.pixel_array
+    except Exception:
+        return 0
+    samples = int(getattr(ds, "SamplesPerPixel", 1) or 1)
+    if arr.ndim == 2:
+        return 1
+    if arr.ndim == 3:
+        return 1 if samples == 3 else arr.shape[0]
+    if arr.ndim == 4:
+        return arr.shape[0]
+    return 1
+
+
+class _ImageCanvas(QLabel):
+    """QLabel subclass that keeps a source QPixmap and scales it to fit,
+    preserving aspect ratio.  Emits ``wheel_scrolled(+1/-1)`` on mouse wheel."""
+
+    wheel_scrolled = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(100, 100)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._src: Optional[QPixmap] = None
+
+    def setSourcePixmap(self, pm: Optional[QPixmap]):
+        self._src = pm
+        self._rescale()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._rescale()
+
+    def _rescale(self):
+        if self._src is None or self._src.isNull():
+            self.setText("No image data")
+            return
+        self.setPixmap(
+            self._src.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        self.wheel_scrolled.emit(-1 if delta > 0 else 1)
+        event.accept()
+
+
+class DicomViewerWindow(QDialog):
+    """Non-modal window that displays a received DICOM dataset.
+
+    Shows patient metadata, image(s), frame slider for multi-frame files, and
+    an optional "Open in Weasis" button when a Weasis path is configured."""
+
+    def __init__(self, record: dict, get_cfg, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setWindowFlags(self.windowFlags() | Qt.Window)
+        self._record = record
+        self._get_cfg = get_cfg
+        self._ds = record["dataset"]
+        self._frame = 0
+        self._wl: Optional[float] = None
+        self._ww: Optional[float] = None
+        self._n_frames = 0
+        self._load_meta()
+        self._build_ui()
+        self.resize(820, 680)
+        self._update_frame()
+
+    def _load_meta(self):
+        ds = self._ds
+        self._n_frames = _count_frames(ds)
+        # Prefer DICOM W/L tags; fall back to auto on first render
+        wc = getattr(ds, "WindowCenter", None)
+        ww = getattr(ds, "WindowWidth", None)
+        if wc is not None and ww is not None:
+            try:
+                self._wl = float(wc) if not hasattr(wc, "__iter__") else float(next(iter(wc)))
+                self._ww = float(ww) if not hasattr(ww, "__iter__") else float(next(iter(ww)))
+            except Exception:
+                pass
+
+    def _build_ui(self):
+        ds = self._ds
+        pn = str(getattr(ds, "PatientName", "") or "").replace("^", " ").strip()
+        pid = str(getattr(ds, "PatientID", "") or "")
+        dob = str(getattr(ds, "PatientBirthDate", "") or "")
+        sex = str(getattr(ds, "PatientSex", "") or "")
+        mod = str(getattr(ds, "Modality", "") or "")
+        date = str(getattr(ds, "StudyDate", "") or "")
+        desc = str(getattr(ds, "StudyDescription", "") or "")
+
+        self.setWindowTitle(f"[dicom.flux]  {pn or 'Unknown Patient'}  [{mod}]")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 8)
+        root.setSpacing(8)
+
+        # --- patient info bar ---
+        info_frame = QFrame()
+        info_frame.setObjectName("infoBar")
+        info_row = QHBoxLayout(info_frame)
+        info_row.setContentsMargins(10, 6, 10, 6)
+        info_row.setSpacing(24)
+
+        def _pair(label: str, value: str):
+            col = QVBoxLayout()
+            col.setSpacing(0)
+            lbl = QLabel(label)
+            lbl.setObjectName("muted")
+            val = QLabel(value or "—")
+            col.addWidget(lbl)
+            col.addWidget(val)
+            return col
+
+        for lbl, val in [
+            ("Patient", pn), ("ID", pid), ("DOB", dob),
+            ("Sex", sex), ("Modality", mod), ("Date", date),
+        ]:
+            info_row.addLayout(_pair(lbl, val))
+        if desc:
+            info_row.addLayout(_pair("Description", desc))
+        info_row.addStretch()
+        root.addWidget(info_frame)
+
+        # --- image canvas ---
+        self._canvas = _ImageCanvas()
+        root.addWidget(self._canvas, stretch=1)
+        self._canvas.wheel_scrolled.connect(self._on_wheel)
+
+        # --- frame / controls bar ---
+        ctrl = QHBoxLayout()
+        ctrl.setSpacing(8)
+
+        self._slider = QSlider(Qt.Horizontal)
+        self._slider.setMinimum(0)
+        self._slider.setMaximum(max(0, self._n_frames - 1))
+        self._slider.setValue(0)
+        self._slider.setVisible(self._n_frames > 1)
+        self._slider.valueChanged.connect(self._on_slider)
+        ctrl.addWidget(self._slider, stretch=1)
+
+        self._frame_lbl = QLabel("1 / 1")
+        self._frame_lbl.setVisible(self._n_frames > 1)
+        ctrl.addWidget(self._frame_lbl)
+
+        cfg = self._get_cfg()
+        weasis = (cfg.get("weasis_path") or "").strip()
+        if weasis:
+            wb = QPushButton("Open in Weasis")
+            wb.clicked.connect(self._open_weasis)
+            ctrl.addWidget(wb)
+
+        root.addLayout(ctrl)
+
+        self._status_lbl = QLabel("")
+        self._status_lbl.setObjectName("muted")
+        root.addWidget(self._status_lbl)
+
+    def _update_frame(self):
+        if self._n_frames == 0:
+            self._canvas.setSourcePixmap(None)
+            self._status_lbl.setText("No pixel data available for this dataset.")
+            return
+        pm = _ds_to_qpixmap(self._ds, self._frame, self._wl, self._ww)
+        self._canvas.setSourcePixmap(pm)
+        self._frame_lbl.setText(f"{self._frame + 1} / {self._n_frames}")
+        wl_s = f"{self._wl:.0f}" if self._wl is not None else "auto"
+        ww_s = f"{self._ww:.0f}" if self._ww is not None else "auto"
+        self._status_lbl.setText(
+            f"Frame {self._frame + 1} / {self._n_frames}  |  "
+            f"W/L {ww_s} / {wl_s}  |  "
+            f"Scroll wheel: {'next/prev frame' if self._n_frames > 1 else 'adjust window width'}"
+        )
+
+    def _on_slider(self, val: int):
+        self._frame = val
+        self._update_frame()
+
+    def _on_wheel(self, delta: int):
+        if self._n_frames > 1:
+            self._frame = max(0, min(self._n_frames - 1, self._frame + delta))
+            self._slider.blockSignals(True)
+            self._slider.setValue(self._frame)
+            self._slider.blockSignals(False)
+            self._update_frame()
+        else:
+            # Single-frame: adjust window width with mouse wheel
+            if self._ww is None:
+                try:
+                    fa = self._ds.pixel_array.astype(np.float32)
+                    mn, mx = float(fa.min()), float(fa.max())
+                    self._ww = (mx - mn) or 1.0
+                    self._wl = (mn + mx) / 2.0
+                except Exception:
+                    return
+            self._ww = max(1.0, self._ww * (1.1 if delta > 0 else 0.9))
+            self._update_frame()
+
+    def _open_weasis(self):
+        cfg = self._get_cfg()
+        weasis = (cfg.get("weasis_path") or "").strip()
+        if not weasis or not Path(weasis).is_file():
+            QMessageBox.warning(
+                self, APP_NAME,
+                "Weasis executable not found.\n\nConfigure the path in Settings."
+            )
+            return
+        sop = self._record.get("sop_instance") or str(generate_uid())
+        stem = re.sub(r"[^A-Za-z0-9_\-]", "_", sop)[-64:] or "dicom"
+        path = _TEMP_DIR / f"{stem}.dcm"
+        try:
+            if not path.exists():
+                ds = self._ds
+                try:
+                    ds.save_as(str(path), enforce_file_format=True)
+                except TypeError:
+                    ds.save_as(str(path), write_like_original=False)
+            subprocess.Popen([weasis, f"--input={path.as_uri()}"])
+        except Exception as exc:
+            QMessageBox.warning(self, APP_NAME, f"Failed to launch Weasis:\n{exc}")
+
+
+def _render_print_layout(record: dict) -> QPixmap:
+    """Compose a simulated film/paper view of a received DICOM print job.
+
+    Draws a dark outer frame, a dark film/paper rectangle with header and
+    footer bands, and the image payload in the centre. Returns a QPixmap
+    sized to fit naturally in the preview window."""
+    orientation = str(record.get("orientation") or "PORTRAIT").upper()
+    landscape = "LANDSCAPE" in orientation
+
+    PW, PH = (850, 660) if landscape else (660, 850)
+    MARGIN = 20
+    HEADER_H = 36
+    FOOTER_H = 28
+
+    pm = QPixmap(PW, PH)
+    pm.fill(QColor("#13131f"))
+
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setRenderHint(QPainter.SmoothPixmapTransform)
+
+    film = QRect(MARGIN, MARGIN, PW - 2 * MARGIN, PH - 2 * MARGIN)
+    p.fillRect(film, QColor("#0a0a0a"))
+    p.setPen(QColor("#2a2a3a"))
+    p.drawRect(film)
+
+    # Header band
+    hdr = QRect(film.x(), film.y(), film.width(), HEADER_H)
+    p.fillRect(hdr, QColor("#161620"))
+    p.setPen(QColor("#c0c0d0"))
+    mono = QFont("Consolas", 8) if sys.platform.startswith("win") else QFont("monospace", 8)
+    p.setFont(mono)
+    ts = record.get("ts")
+    ts_str = ts.strftime("%Y-%m-%d %H:%M:%S") if ts else ""
+    from_ae = record.get("from_ae", "?")
+    medium = record.get("medium", "")
+    p.drawText(hdr.adjusted(10, 0, -10, 0), Qt.AlignVCenter | Qt.AlignLeft,
+               f"{from_ae}  ·  {medium}  ·  {ts_str}")
+
+    # Footer band
+    ftr = QRect(film.x(), film.y() + film.height() - FOOTER_H, film.width(), FOOTER_H)
+    p.fillRect(ftr, QColor("#161620"))
+    p.setPen(QColor("#888898"))
+    small = QFont("Consolas", 7) if sys.platform.startswith("win") else QFont("monospace", 7)
+    p.setFont(small)
+    film_size = record.get("film_size", "")
+    copies = record.get("copies", "")
+    priority = record.get("priority", "")
+    fmt = record.get("display_format", "")
+    dest = record.get("destination", "")
+    p.drawText(ftr.adjusted(10, 0, -10, 0), Qt.AlignVCenter | Qt.AlignLeft,
+               f"Film: {film_size}  ·  {orientation}  ·  Format: {fmt}  ·  "
+               f"Copies: {copies}  ·  Priority: {priority}  ·  Dest: {dest}")
+
+    # Image area
+    img_area = QRect(
+        film.x() + 8,
+        film.y() + HEADER_H + 8,
+        film.width() - 16,
+        film.height() - HEADER_H - FOOTER_H - 16,
+    )
+
+    img_attrs = record.get("image_attrs")
+    img_drawn = False
+
+    print(f"[print-preview] ----- opening print preview from {record.get('from_ae','?')} -----", flush=True)
+    print(f"[print-preview] image_attrs is None?  {img_attrs is None}", flush=True)
+    if img_attrs is not None:
+        try:
+            print(f"[print-preview] image_attrs len = {len(img_attrs)}", flush=True)
+            print(f"[print-preview] image_attrs top-level elements:", flush=True)
+            for elem in img_attrs:
+                vr = getattr(elem, "VR", "?")
+                kw = getattr(elem, "keyword", "") or ""
+                tag = getattr(elem, "tag", "?")
+                if vr == "SQ":
+                    n = len(elem.value) if elem.value else 0
+                    print(f"[print-preview]   {tag} {kw} VR=SQ items={n}", flush=True)
+                else:
+                    val = getattr(elem, "value", None)
+                    val_repr = repr(val)
+                    if len(val_repr) > 80:
+                        val_repr = val_repr[:77] + "..."
+                    print(f"[print-preview]   {tag} {kw} VR={vr} value={val_repr}", flush=True)
+        except Exception as exc:
+            print(f"[print-preview] failed to inspect image_attrs: {exc}", flush=True)
+
+    if img_attrs is not None and len(img_attrs) > 0:
+        # Locate the dataset that contains PixelData. dicom.flux SCU puts image
+        # data in PreformattedGrayscaleImageSequence (tag 2020,0110); some other
+        # implementations use BasicGrayscaleImageSequence or direct PixelData.
+        img_ds = None
+
+        # 1. Try known sequence keywords / tags
+        for seq_tag in (
+            (0x2020, 0x0110),  # PreformattedGrayscaleImageSequence
+            (0x2020, 0x0111),  # PreformattedColorImageSequence
+        ):
+            elem = img_attrs.get(seq_tag)
+            if elem is not None and elem.VR == "SQ" and elem.value:
+                img_ds = elem.value[0]
+                print(f"[print-preview] step 1: found image dataset via tag {seq_tag}", flush=True)
+                break
+
+        # 2. Keyword-based access (works if pydicom knows the tag)
+        if img_ds is None:
+            for kw in ("PreformattedGrayscaleImageSequence",
+                       "BasicGrayscaleImageSequence",
+                       "PreformattedColorImageSequence"):
+                seq = getattr(img_attrs, kw, None)
+                if seq:
+                    img_ds = seq[0]
+                    print(f"[print-preview] step 2: found image dataset via keyword {kw}", flush=True)
+                    break
+
+        # 3. PixelData directly on the attribute dataset
+        if img_ds is None and img_attrs.get((0x7FE0, 0x0010)) is not None:
+            img_ds = img_attrs
+            print("[print-preview] step 3: PixelData found directly on img_attrs", flush=True)
+
+        # 4. Exhaustive: search every SQ element for a dataset with PixelData
+        if img_ds is None:
+            for elem in img_attrs:
+                if elem.VR == "SQ" and elem.value:
+                    for item in elem.value:
+                        if item.get((0x7FE0, 0x0010)) is not None:
+                            img_ds = item
+                            print(f"[print-preview] step 4: found PixelData inside SQ {elem.tag}", flush=True)
+                            break
+                if img_ds is not None:
+                    break
+
+        if img_ds is None:
+            print("[print-preview] no image dataset located after all 4 steps", flush=True)
+        else:
+            try:
+                rows = img_ds.get((0x0028, 0x0010))
+                cols = img_ds.get((0x0028, 0x0011))
+                bits = img_ds.get((0x0028, 0x0100))
+                samples = img_ds.get((0x0028, 0x0002))
+                pi_el = img_ds.get((0x0028, 0x0004))
+                pd = img_ds.get((0x7FE0, 0x0010))
+                print(
+                    f"[print-preview] img_ds: Rows={rows.value if rows else None} "
+                    f"Columns={cols.value if cols else None} "
+                    f"BitsAllocated={bits.value if bits else None} "
+                    f"SamplesPerPixel={samples.value if samples else None} "
+                    f"PI={pi_el.value if pi_el else None} "
+                    f"PixelData_len={len(pd.value) if pd else 0}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[print-preview] failed to inspect img_ds: {exc}", flush=True)
+
+            try:
+                pm_img = _ds_to_qpixmap(img_ds, 0)
+                if pm_img is None:
+                    print("[print-preview] _ds_to_qpixmap returned None", flush=True)
+                elif pm_img.isNull():
+                    print("[print-preview] _ds_to_qpixmap returned a null QPixmap", flush=True)
+                else:
+                    print(f"[print-preview] rendered QPixmap {pm_img.width()}x{pm_img.height()}", flush=True)
+                    scaled = pm_img.scaled(
+                        img_area.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                    )
+                    ix = img_area.x() + (img_area.width() - scaled.width()) // 2
+                    iy = img_area.y() + (img_area.height() - scaled.height()) // 2
+                    p.drawPixmap(ix, iy, scaled)
+                    img_drawn = True
+            except Exception as exc:
+                print(f"[print-preview] _ds_to_qpixmap raised: {type(exc).__name__}: {exc}", flush=True)
+    print(f"[print-preview] img_drawn = {img_drawn}", flush=True)
+
+    if not img_drawn:
+        p.setPen(QColor("#2a2a3a"))
+        p.drawRect(img_area)
+        p.setPen(QColor("#555566"))
+        p.setFont(QFont("sans-serif", 10))
+        has_attrs = img_attrs is not None and len(img_attrs) > 0
+        msg = (
+            "Image data received but could not be decoded"
+            if has_attrs else
+            "No image data in this print job\n(N-SET image box was not received)"
+        )
+        p.drawText(img_area, Qt.AlignCenter, msg)
+
+    p.end()
+    return pm
+
+
+class PrintPreviewWindow(QDialog):
+    """Non-modal window that shows a received print job as a simulated
+    film/paper layout — image + header/footer metadata bands."""
+
+    def __init__(self, record: dict, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setWindowFlags(self.windowFlags() | Qt.Window)
+        self._record = record
+        ae = record.get("from_ae", "?")
+        self.setWindowTitle(f"[dicom.flux]  Print Preview — {ae}")
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        canvas = _ImageCanvas()
+        root.addWidget(canvas)
+        pm = _render_print_layout(self._record)
+        canvas.setSourcePixmap(pm)
+        # Size window to match film aspect ratio with some padding
+        self.resize(pm.width() + 4, pm.height() + 4)
+
+
+# ---------------------------------------------------------------------------
+# Data tab
+# ---------------------------------------------------------------------------
 class DataTab(QWidget):
     """Browse C-STORE'd files and the worklist data the SCP serves."""
 
-    def __init__(self):
+    def __init__(self, get_cfg=None):
         super().__init__()
+        self._get_cfg = get_cfg or (lambda: {})
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
@@ -2682,7 +3467,9 @@ class DataTab(QWidget):
         splitter = QSplitter(Qt.Vertical)
 
         # --- Received DICOM files -----------------------------------------
-        recv_box = QGroupBox("Received DICOM files (via built-in C-STORE SCP)")
+        recv_box = QGroupBox(
+            "Received DICOM files (via built-in C-STORE SCP)  —  double-click to view"
+        )
         rl = QVBoxLayout(recv_box)
         self.recv_table = QTableWidget(0, 6)
         self.recv_table.setHorizontalHeaderLabels(
@@ -2693,6 +3480,7 @@ class DataTab(QWidget):
         self.recv_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.recv_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.recv_table.verticalHeader().setVisible(False)
+        self.recv_table.cellDoubleClicked.connect(self._open_viewer)
         rl.addWidget(self.recv_table, 1)
         recv_btns = QHBoxLayout()
         self.save_btn = QPushButton("Save Selected to Folder...")
@@ -2709,7 +3497,9 @@ class DataTab(QWidget):
         splitter.addWidget(recv_box)
 
         # --- Received print jobs ------------------------------------------
-        print_box = QGroupBox("Received print jobs (via built-in Print SCP)")
+        print_box = QGroupBox(
+            "Received print jobs (via built-in Print SCP)  —  double-click to preview"
+        )
         pl = QVBoxLayout(print_box)
         self.print_table = QTableWidget(0, 7)
         self.print_table.setHorizontalHeaderLabels(
@@ -2720,6 +3510,7 @@ class DataTab(QWidget):
         self.print_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.print_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.print_table.verticalHeader().setVisible(False)
+        self.print_table.cellDoubleClicked.connect(self._open_print_preview)
         pl.addWidget(self.print_table, 1)
         print_btns = QHBoxLayout()
         self.clear_print_btn = QPushButton("Clear")
@@ -2774,6 +3565,22 @@ class DataTab(QWidget):
     @Slot(dict)
     def _on_print_received(self, _record: dict):
         self.refresh_print_jobs()
+
+    def _open_viewer(self, row: int, _col: int):
+        with RECEIVED_LOCK:
+            snapshot = list(RECEIVED_FILES)
+        if row >= len(snapshot):
+            return
+        win = DicomViewerWindow(snapshot[row], self._get_cfg, parent=self)
+        win.show()
+
+    def _open_print_preview(self, row: int, _col: int):
+        with PRINT_LOCK:
+            jobs = list(PRINT_JOBS)
+        if row >= len(jobs):
+            return
+        win = PrintPreviewWindow(jobs[row], parent=self)
+        win.show()
 
     def refresh_print_jobs(self):
         with PRINT_LOCK:
@@ -2959,7 +3766,7 @@ class GroupedTabBar(QTabBar):
             self.setTabText(self._spacer_index, old)
 
     def mousePressEvent(self, event):
-        idx = self.tabAt(event.pos())
+        idx = self.tabAt(event.position().toPoint())
         if idx == self._spacer_index:
             event.ignore()
             return
@@ -2985,7 +3792,7 @@ class MainWindow(QMainWindow):
         self.mwl_tab = MWLTab(get_local)
         self.send_tab = SendTab(get_local)
         self.print_tab = PrintTab(get_local)
-        self.data_tab = DataTab()
+        self.data_tab = DataTab(get_local)
         self.logs_tab = LogsTab(get_theme)
         self.settings_tab = SettingsTab(self.cfg, self.apply_settings)
 
@@ -3051,11 +3858,12 @@ class MainWindow(QMainWindow):
         self._scp_label.setText(
             f"  Listening IP: {ip}   "
             f"Port: {self.cfg['local_port']}   "
-            f"AE: '{self.cfg['local_ae']}'  "
+            f"AE: {self.cfg['local_ae']}  "
         )
 
     def closeEvent(self, event):
         SCP.stop()
+        shutil.rmtree(str(_TEMP_DIR), ignore_errors=True)
         super().closeEvent(event)
 
 
