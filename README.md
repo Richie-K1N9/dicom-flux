@@ -31,10 +31,10 @@ pip install pyinstaller
 pyinstaller --onefile --windowed ^
             --icon assets\dicom_flux.ico ^
             --add-data "assets\dicom_flux.svg;assets" ^
-            --name dicom.flux main.py
+            --name "[dicom.flux]" main.py
 ```
 
-The binary is written to `dist\dicom.flux.exe`.
+The binary is written to `dist\[dicom.flux].exe`.
 
 ### Linux (single ELF binary)
 
@@ -42,10 +42,10 @@ The binary is written to `dist\dicom.flux.exe`.
 pip install pyinstaller
 pyinstaller --onefile \
             --add-data "assets/dicom_flux.svg:assets" \
-            --name dicom.flux main.py
+            --name "[dicom.flux]" main.py
 ```
 
-The binary is written to `dist/dicom.flux`. Build on the target distro/glibc
+The binary is written to `dist/[dicom.flux]`. Build on the target distro/glibc
 you intend to run on. (Linux executables don't carry a file icon — use a
 `.desktop` entry pointing at `assets/dicom_flux.svg` if you want a launcher
 icon.)

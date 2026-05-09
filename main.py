@@ -6,7 +6,9 @@ import ctypes
 import json
 import logging
 import os
+import platform
 import random
+import re
 import socket
 import string
 import sys
@@ -56,7 +58,7 @@ from pynetdicom.sop_class import (
 )
 
 from PySide6.QtCore import Qt, QObject, Signal, QThread, QTimer, Slot, QSize, QDate
-from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QBrush, QAction, QPalette
+from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QBrush, QAction, QPalette, QKeySequence
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
@@ -90,10 +92,15 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QCalendarWidget,
+    QMenu,
 )
 
 APP_NAME = "[dicom.flux]"
 APP_VERSION = "1.0.0"
+APP_AUTHOR = "Richie-K1N9"
+APP_COPYRIGHT_YEAR = "2026"
+APP_LICENSE = "MIT"
+APP_REPO_URL = "https://github.com/Richie-K1N9/dicom-flux"
 CONFIG_DIR = Path.home() / ".dicom_flux"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
@@ -188,6 +195,55 @@ def save_config(cfg: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Windows Controlled Folder Access detection
+# ---------------------------------------------------------------------------
+# Default CFA-protected folder names (direct children of %USERPROFILE%).
+_CFA_PROTECTED_NAMES = {
+    "Documents", "Desktop", "Pictures", "Music", "Videos",
+    "Favorites", "OneDrive",
+}
+
+
+def _is_cfa_path(path: Path) -> bool:
+    """Return True if *path* is inside a CFA-protected user folder on Windows."""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        rel = path.resolve().relative_to(Path.home().resolve())
+        return rel.parts[0] in _CFA_PROTECTED_NAMES
+    except (ValueError, IndexError):
+        return False
+
+
+def _show_cfa_error_dialog(parent, path: Path) -> None:
+    """Show a Controlled Folder Access explanation with a direct link to fix it."""
+    dlg = QMessageBox(parent)
+    dlg.setWindowTitle(APP_NAME)
+    dlg.setIcon(QMessageBox.Warning)
+    dlg.setTextFormat(Qt.RichText)
+    dlg.setText(
+        "<b>Save blocked — Windows Controlled Folder Access</b><br><br>"
+        "Windows Defender's ransomware protection prevented this app from "
+        f"writing to the chosen folder.<br><br>"
+        "<b>To fix this, choose one of:</b><br>"
+        "&#x2022;&nbsp;<b>Whitelist this app</b> — open Windows Security &rsaquo; "
+        "Virus &amp; threat protection &rsaquo; Ransomware protection &rsaquo; "
+        "<i>Allow an app through Controlled folder access</i>, then add "
+        "<code>[dicom.flux].exe</code>.<br><br>"
+        "&#x2022;&nbsp;<b>Save to a different folder</b> — use Downloads or "
+        "another location outside Documents / Desktop / Pictures."
+    )
+    open_btn = dlg.addButton("Open Windows Security", QMessageBox.ActionRole)
+    dlg.addButton(QMessageBox.Ok)
+    dlg.exec()
+    if dlg.clickedButton() is open_btn:
+        try:
+            os.startfile("windowsdefender://ransomwareprotection")
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Logger - Qt-signal based
 # ---------------------------------------------------------------------------
 class LogBus(QObject):
@@ -209,6 +265,97 @@ PRINT_JOBS: list[dict] = []
 PRINT_LOCK = threading.Lock()
 
 
+# Each DICOM transaction (one Echo, one MWL query, one Store, one Print
+# job, one inbound association on the SCP, etc.) gets a unique op_id so
+# the Logs tab can highlight all related rows when one is clicked. The
+# id lives in thread-local storage; pynetdicom log records emitted
+# synchronously on the same thread inherit it automatically.
+import itertools  # placed here to keep stdlib import close to its only consumer
+_log_context = threading.local()
+_op_id_counter = itertools.count(1)
+_op_id_lock = threading.Lock()
+
+# When an SCU call is in-flight on a Worker thread, pynetdicom's internal
+# reactor thread emits log records that have no thread-local op_id.  We track
+# the single active SCU op_id here so the log handler can inherit it.
+_active_scu_op_id: Optional[int] = None
+_active_scu_op_lock = threading.Lock()
+
+# For inbound SCP associations, pynetdicom's DIMSE sub-thread emits messages
+# ("Received Echo Request", "Received Store Request") on a thread that is
+# separate from the association callback thread where we set the thread-local
+# op_id.  We keep a dict of assoc_key -> op_id for all live associations so
+# the log handler can inherit the right op_id on those untagged threads.
+_active_scp_op_ids: dict[int, int] = {}
+_active_scp_op_lock = threading.Lock()
+
+
+def _next_op_id() -> int:
+    with _op_id_lock:
+        return next(_op_id_counter)
+
+
+def _current_op_id() -> Optional[int]:
+    return getattr(_log_context, "op_id", None)
+
+
+class log_operation:
+    """Context manager that tags every log emitted within its scope with a
+    fresh operation id, so the Logs tab can group/highlight related rows.
+
+    Pass ``scu=True`` for SCU calls so pynetdicom's background reactor thread
+    can inherit the op_id via the ``_active_scu_op_id`` global."""
+
+    def __init__(self, label: str = "", scu: bool = False):
+        self.label = label
+        self.scu = scu
+        self.op_id: Optional[int] = None
+        self._prev: Optional[int] = None
+
+    def __enter__(self) -> int:
+        global _active_scu_op_id
+        self._prev = getattr(_log_context, "op_id", None)
+        self.op_id = _next_op_id()
+        _log_context.op_id = self.op_id
+        if self.scu:
+            with _active_scu_op_lock:
+                _active_scu_op_id = self.op_id
+        return self.op_id
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        global _active_scu_op_id
+        _log_context.op_id = self._prev
+        if self.scu:
+            with _active_scu_op_lock:
+                _active_scu_op_id = None
+
+
+def with_op_id(label: str, scu: bool = False):
+    """Decorator that runs the wrapped function inside a fresh log_operation
+    scope so all of its log emissions share the same op_id. Handles both
+    regular functions and generator functions (used by pynetdicom C-FIND
+    handlers, which yield successive responses).
+
+    Pass ``scu=True`` for top-level SCU calls so background pynetdicom threads
+    can inherit the op_id."""
+    import inspect
+
+    def decorator(fn):
+        if inspect.isgeneratorfunction(fn):
+            def wrapper(*args, **kwargs):
+                with log_operation(label, scu=scu):
+                    yield from fn(*args, **kwargs)
+        else:
+            def wrapper(*args, **kwargs):
+                with log_operation(label, scu=scu):
+                    return fn(*args, **kwargs)
+        wrapper.__name__ = fn.__name__
+        wrapper.__doc__ = fn.__doc__
+        return wrapper
+
+    return decorator
+
+
 def _emit_log(direction: str, level: str, source: str, message: str, details: str = ""):
     LOG_BUS.log.emit(
         {
@@ -218,6 +365,7 @@ def _emit_log(direction: str, level: str, source: str, message: str, details: st
             "source": source,
             "message": message,
             "details": details,
+            "op_id": _current_op_id(),
         }
     )
 
@@ -238,13 +386,33 @@ def log_system(source: str, message: str, details: str = "", level: str = "info"
     _emit_log("system", level, source, message, details)
 
 
-# Bridge pynetdicom's logging into our log bus so the Logs tab shows raw
-# network activity at human-readable detail.
+# Bridge pynetdicom's logging into our log bus. pynetdicom dumps every
+# DICOM tag of every C-FIND/C-STORE request and response on its own log
+# line, which floods the UI; the patterns below match those raw-dataset
+# lines so we can drop them while keeping the higher-level events
+# (Association/Find/Store/Status messages).
+_PYNETDICOM_DUMP_PATTERNS = (
+    re.compile(r"^\s*\([0-9A-Fa-f]{4},[0-9A-Fa-f]{4}\)"),  # (gggg,eeee) tag rows
+    re.compile(r"^\s*\(Sequence item #"),
+    re.compile(r"^\s*#\s*(Request|Response) Identifier"),
+)
+
+
+def _is_pynetdicom_dataset_dump(msg: str) -> bool:
+    if not msg.strip():
+        return True  # blank separator lines pynetdicom emits between tags
+    return any(p.match(msg) for p in _PYNETDICOM_DUMP_PATTERNS)
+
+
 class PynetdicomLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = self.format(record)
         except Exception:
+            return
+        # Suppress raw per-tag dataset dumps; the SCU/SCP code emits its
+        # own structured per-match log entry with details attached.
+        if record.levelno < logging.WARNING and _is_pynetdicom_dataset_dump(msg):
             return
         level = "info"
         if record.levelno >= logging.ERROR:
@@ -258,6 +426,26 @@ class PynetdicomLogHandler(logging.Handler):
             direction = "in"
         elif "association acceptance" in text or "sent" in text or "sending" in text:
             direction = "out"
+        # If this record arrives on pynetdicom's internal DIMSE sub-thread it
+        # won't have a thread-local op_id.  Try to inherit:
+        #   1. The active SCU op_id (reactor thread during an outbound call).
+        #   2. The most-recently-active SCP op_id (DIMSE sub-thread for an
+        #      inbound association — e.g. "Received Echo Request").
+        if _current_op_id() is None:
+            inherited: Optional[int] = None
+            with _active_scu_op_lock:
+                inherited = _active_scu_op_id
+            if inherited is None:
+                with _active_scp_op_lock:
+                    if _active_scp_op_ids:
+                        inherited = next(reversed(_active_scp_op_ids.values()))
+            if inherited is not None:
+                _log_context.op_id = inherited
+                try:
+                    _emit_log(direction, level, "pynetdicom", msg)
+                finally:
+                    _log_context.op_id = None
+                return
         _emit_log(direction, level, "pynetdicom", msg)
 
 
@@ -465,6 +653,10 @@ class SCPServer:
         # Print state per-association
         self._film_sessions: dict[str, dict] = {}
         self._film_boxes: dict[str, dict] = {}
+        # One op_id per inbound association so all events (TCP open,
+        # DIMSE handlers, TCP close) are grouped together in the log.
+        self._assoc_op_ids: dict[int, int] = {}
+        self._assoc_op_lock = threading.Lock()
 
     def start(self, port: int, ae_title: str):
         self.stop()
@@ -519,16 +711,45 @@ class SCPServer:
                 self.ae = None
                 log_system("SCP", "Listener stopped")
 
+    # ----- helpers -------------------------------------------------------
+    def _set_assoc_op(self, event) -> None:
+        """Set the thread-local op_id to the shared op_id for this association.
+
+        Also registers the op_id in ``_active_scp_op_ids`` so pynetdicom's
+        internal DIMSE sub-thread (which is separate from the callback thread
+        and has no thread-local op_id) can inherit it via the log handler."""
+        key = id(event.assoc)
+        with self._assoc_op_lock:
+            if key not in self._assoc_op_ids:
+                self._assoc_op_ids[key] = _next_op_id()
+            op_id = self._assoc_op_ids[key]
+        _log_context.op_id = op_id
+        with _active_scp_op_lock:
+            _active_scp_op_ids[key] = op_id
+
+    def _clear_assoc_op(self, event) -> None:
+        """Remove the association op_id mapping after the connection closes."""
+        key = id(event.assoc)
+        with self._assoc_op_lock:
+            self._assoc_op_ids.pop(key, None)
+        with _active_scp_op_lock:
+            _active_scp_op_ids.pop(key, None)
+        _log_context.op_id = None
+
     # ----- event handlers ------------------------------------------------
     def _on_conn_open(self, event):
+        self._set_assoc_op(event)
         peer = event.address
         log_in("SCP", f"TCP connection opened from {peer[0]}:{peer[1]}")
 
     def _on_conn_close(self, event):
+        self._set_assoc_op(event)
         peer = event.address
         log_in("SCP", f"TCP connection closed from {peer[0]}:{peer[1]}")
+        self._clear_assoc_op(event)
 
     def _on_requested(self, event):
+        self._set_assoc_op(event)
         ar = event.assoc.requestor
         log_in(
             "SCP",
@@ -537,18 +758,22 @@ class SCPServer:
         )
 
     def _on_released(self, event):
+        self._set_assoc_op(event)
         ar = event.assoc.requestor
         log_in("SCP", f"Association released by {ar.ae_title}", level="info")
 
     def _on_aborted(self, event):
+        self._set_assoc_op(event)
         log_in("SCP", "Association aborted", level="warning")
 
     def _on_c_echo(self, event):
+        self._set_assoc_op(event)
         ar = event.assoc.requestor
         log_in("SCP", f"C-ECHO received from {ar.ae_title}", level="success")
         return 0x0000
 
     def _on_c_find(self, event):
+        self._set_assoc_op(event)
         ar = event.assoc.requestor
         req_ds: Dataset = event.identifier
         if event.request.AffectedSOPClassUID != ModalityWorklistInformationFind:
@@ -572,6 +797,7 @@ class SCPServer:
         yield 0x0000, None
 
     def _on_c_store(self, event):
+        self._set_assoc_op(event)
         ar = event.assoc.requestor
         ds: Dataset = event.dataset
         ds.file_meta = event.file_meta
@@ -601,6 +827,7 @@ class SCPServer:
 
     # --- print handlers --------------------------------------------------
     def _on_n_create(self, event):
+        self._set_assoc_op(event)
         ar = event.assoc.requestor
         sop_class = event.request.AffectedSOPClassUID
         sop_instance = event.request.AffectedSOPInstanceUID or generate_uid()
@@ -638,6 +865,7 @@ class SCPServer:
         return 0x0000, attrs
 
     def _on_n_set(self, event):
+        self._set_assoc_op(event)
         sop_class = event.request.RequestedSOPClassUID
         sop_instance = event.request.RequestedSOPInstanceUID
         attrs = event.attribute_list or Dataset()
@@ -654,6 +882,7 @@ class SCPServer:
         return 0x0000, attrs
 
     def _on_n_action(self, event):
+        self._set_assoc_op(event)
         ar = event.assoc.requestor
         sop_class = event.request.RequestedSOPClassUID
         sop_instance = str(event.request.RequestedSOPInstanceUID or "")
@@ -688,6 +917,7 @@ class SCPServer:
         return 0x0000, None
 
     def _on_n_delete(self, event):
+        self._set_assoc_op(event)
         sop_class = event.request.RequestedSOPClassUID
         sop_instance = event.request.RequestedSOPInstanceUID
         self._film_sessions.pop(sop_instance, None)
@@ -696,6 +926,7 @@ class SCPServer:
         return 0x0000
 
     def _on_n_get(self, event):
+        self._set_assoc_op(event)
         sop_class = event.request.RequestedSOPClassUID
         if sop_class == Printer:
             ds = Dataset()
@@ -806,6 +1037,7 @@ class Worker(QThread):
         self.finished_with_result.emit(ok, summary, details)
 
 
+@with_op_id("echo", scu=True)
 def scu_echo(local_ae: str, ip: str, port: int, remote_ae: str, timeout: int = 10):
     log_out("Echo SCU", f"Associating with {remote_ae}@{ip}:{port}")
     ae = AE(ae_title=local_ae)
@@ -829,6 +1061,7 @@ def scu_echo(local_ae: str, ip: str, port: int, remote_ae: str, timeout: int = 1
         assoc.release()
 
 
+@with_op_id("mwl", scu=True)
 def scu_find_mwl(
     local_ae: str,
     ip: str,
@@ -883,7 +1116,11 @@ def scu_find_mwl(
                     row["Station AE"] = str(getattr(s, "ScheduledStationAETitle", ""))
                     row["Procedure"] = str(getattr(s, "ScheduledProcedureStepDescription", ""))
                 rows.append(row)
-                log_in("MWL SCU", f"Match: {row['PatientName']} / {row.get('Date', '')}")
+                log_in(
+                    "MWL SCU",
+                    f"Match: {row['PatientName']} / {row.get('Date', '')}",
+                    json.dumps(row, indent=2),
+                )
     finally:
         assoc.release()
 
@@ -891,6 +1128,7 @@ def scu_find_mwl(
     return True, summary, json.dumps(rows, indent=2)
 
 
+@with_op_id("store", scu=True)
 def scu_store(
     local_ae: str,
     ip: str,
@@ -948,6 +1186,7 @@ def scu_store(
     return ok, summary, "\n".join(failures) if failures else ""
 
 
+@with_op_id("printer-query", scu=True)
 def scu_query_printer(
     local_ae: str, ip: str, port: int, remote_ae: str, timeout: int = 10
 ):
@@ -983,6 +1222,7 @@ def scu_query_printer(
         assoc.release()
 
 
+@with_op_id("print", scu=True)
 def scu_print(
     local_ae: str,
     ip: str,
@@ -1138,8 +1378,8 @@ THEMES = {
         "border": "#252525",
         "hover": "#1a1a1a",
         "selected": "#1f2c3a",
-        "out": "#3aa0ff",
-        "in": "#b85cff",
+        "out": "#b85cff",
+        "in": "#3aa0ff",
         "ok": "#22c55e",
         "err": "#ef4444",
         "warn": "#f59e0b",
@@ -1154,8 +1394,8 @@ THEMES = {
         "border": "#3a3f47",
         "hover": "#33373f",
         "selected": "#324a67",
-        "out": "#5aa9ff",
-        "in": "#c084fc",
+        "out": "#c084fc",
+        "in": "#5aa9ff",
         "ok": "#22c55e",
         "err": "#ef4444",
         "warn": "#f59e0b",
@@ -1170,8 +1410,8 @@ THEMES = {
         "border": "#d1d5db",
         "hover": "#e5e7eb",
         "selected": "#cfe1ff",
-        "out": "#1e6fea",
-        "in": "#7c3aed",
+        "out": "#7c3aed",
+        "in": "#1e6fea",
         "ok": "#15803d",
         "err": "#b91c1c",
         "warn": "#b45309",
@@ -1249,13 +1489,26 @@ def build_qss(theme: dict) -> str:
         selection-background-color: {theme['selected']};
         color: {theme['fg']};
     }}
-    QComboBox QAbstractItemView {{
+    QFrame#comboPopupFrame {{
         background-color: {theme['input']};
+        border: 1px solid {theme['border']};
+        border-radius: 6px;
+    }}
+    QComboBox QAbstractItemView {{
+        background: transparent;
         selection-background-color: {theme['selected']};
         color: {theme['fg']};
-        border: 1px solid {theme['border']};
+        border: 0;
         outline: 0;
-        padding: 2px;
+        padding: 4px;
+    }}
+    QComboBox QAbstractItemView::item {{
+        border-radius: 3px;
+        padding: 4px 6px;
+        min-height: 20px;
+    }}
+    QComboBox QAbstractItemView::item:selected {{
+        background-color: {theme['selected']};
     }}
     QComboBox::drop-down {{
         subcontrol-origin: padding;
@@ -1419,6 +1672,35 @@ def build_qss(theme: dict) -> str:
 # ---------------------------------------------------------------------------
 # UI helpers
 # ---------------------------------------------------------------------------
+class FlatComboBox(QComboBox):
+    """QComboBox whose drop-down popup honours QSS border-radius.
+
+    Qt's default popup is a top-level window with an OS-drawn square frame,
+    so rounded corners from the stylesheet are clipped away. Making the
+    popup window frameless + translucent lets the QSS-rounded background
+    show through.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Configure the popup container before any native window resources
+        # are created — translucency and frameless flags only take effect
+        # if applied before the first show().
+        view = self.view()
+        container = view.parent() if view is not None else None
+        if isinstance(container, QFrame):
+            container.setObjectName("comboPopupFrame")
+            container.setFrameShape(QFrame.NoFrame)
+            container.setAttribute(Qt.WA_TranslucentBackground, True)
+            container.setWindowFlag(Qt.FramelessWindowHint, True)
+            container.setWindowFlag(Qt.NoDropShadowWindowHint, True)
+            # Force the QSS engine to re-evaluate styles after the
+            # objectName change so QFrame#comboPopupFrame rules apply.
+            style = container.style()
+            style.unpolish(container)
+            style.polish(container)
+
+
 class DateRangePopup(QDialog):
     """Calendar-based picker that returns a date or YYYYMMDD-YYYYMMDD range."""
 
@@ -1731,7 +2013,7 @@ class SendTab(QWidget):
         src_box = QGroupBox("Source")
         sl = QGridLayout(src_box)
         sl.addWidget(QLabel("Built-in sample"), 0, 0)
-        self.modality_combo = QComboBox()
+        self.modality_combo = FlatComboBox()
         self.modality_combo.addItems(MODALITIES)
         sl.addWidget(self.modality_combo, 0, 1)
         self.upload_btn = QPushButton("Upload .dcm or .zip...")
@@ -1858,7 +2140,7 @@ class PrintTab(QWidget):
         ml = QGridLayout(media_box)
         self.query_btn = QPushButton("Query Printer")
         self.query_btn.clicked.connect(self.do_query)
-        self.medium_combo = QComboBox()
+        self.medium_combo = FlatComboBox()
         self.medium_combo.addItems(MEDIUM_TYPES)
         ml.addWidget(self.query_btn, 0, 0)
         ml.addWidget(QLabel("Medium Type"), 0, 1)
@@ -1872,7 +2154,7 @@ class PrintTab(QWidget):
         src_box = QGroupBox("Source")
         sl = QGridLayout(src_box)
         sl.addWidget(QLabel("Built-in sample"), 0, 0)
-        self.modality_combo = QComboBox()
+        self.modality_combo = FlatComboBox()
         self.modality_combo.addItems(MODALITIES)
         sl.addWidget(self.modality_combo, 0, 1)
         self.upload_btn = QPushButton("Upload .dcm...")
@@ -1976,6 +2258,9 @@ class LogsTab(QWidget):
         super().__init__()
         self.get_theme = get_theme
         self._entries: list[dict] = []
+        # Rows whose op_id matches a currently-selected row's op_id, minus
+        # the selected rows themselves. Repainted via the delegate.
+        self._associated_rows: set[int] = set()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
@@ -1985,7 +2270,7 @@ class LogsTab(QWidget):
         title.setObjectName("title")
         top.addWidget(title)
         top.addStretch(1)
-        self.filter_combo = QComboBox()
+        self.filter_combo = FlatComboBox()
         self.filter_combo.addItems(["All", "Outgoing", "Incoming", "Errors", "System"])
         self.filter_combo.currentIndexChanged.connect(self._refresh)
         top.addWidget(QLabel("Filter:"))
@@ -2004,10 +2289,19 @@ class LogsTab(QWidget):
         self.table.setColumnWidth(2, 130)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setAlternatingRowColors(True)
-        self.table.itemSelectionChanged.connect(self._show_details)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(22)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_context_menu)
+        copy_action = QAction("Copy", self.table)
+        copy_action.setShortcut(QKeySequence.Copy)
+        copy_action.setShortcutContext(Qt.WidgetShortcut)
+        copy_action.triggered.connect(self._copy_selected_rows)
+        self.table.addAction(copy_action)
+        self._copy_action = copy_action
         splitter.addWidget(self.table)
 
         self.details = QPlainTextEdit()
@@ -2023,6 +2317,7 @@ class LogsTab(QWidget):
         self._entries.clear()
         self.table.setRowCount(0)
         self.details.clear()
+        self._associated_rows.clear()
 
     @Slot(dict)
     def _on_log(self, entry: dict):
@@ -2050,6 +2345,7 @@ class LogsTab(QWidget):
 
     def _refresh(self):
         self.table.setRowCount(0)
+        self._associated_rows.clear()
         for e in self._entries:
             if self._matches_filter(e):
                 self._append_row(e)
@@ -2100,14 +2396,57 @@ class LogsTab(QWidget):
         self.table.setItem(r, 3, msg_item)
         self.table.scrollToBottom()
 
-    def _show_details(self):
-        rows = self.table.selectionModel().selectedRows()
-        if not rows:
+    def _selected_row_set(self) -> set[int]:
+        return {i.row() for i in self.table.selectionModel().selectedIndexes()}
+
+    def _entry_for_row(self, row: int) -> Optional[dict]:
+        item = self.table.item(row, 1)
+        return item.data(Qt.UserRole) if item is not None else None
+
+    def _on_selection_changed(self):
+        # Recompute the set of "associated" rows (same op_id as any selected
+        # row, but not selected themselves). Toggle a tinted background on
+        # those rows via setBackground so the styling lives on the items
+        # rather than fighting the cell painter.
+        selected = self._selected_row_set()
+        op_ids: set[int] = set()
+        for r in selected:
+            entry = self._entry_for_row(r)
+            if entry and entry.get("op_id") is not None:
+                op_ids.add(entry["op_id"])
+        new_associated: set[int] = set()
+        if op_ids:
+            for r in range(self.table.rowCount()):
+                if r in selected:
+                    continue
+                entry = self._entry_for_row(r)
+                if entry and entry.get("op_id") in op_ids:
+                    new_associated.add(r)
+
+        if new_associated != self._associated_rows:
+            tint = QColor(self.get_theme()["selected"])
+            tint.setAlpha(110)
+            tint_brush = QBrush(tint)
+            clear_brush = QBrush()
+            cols = self.table.columnCount()
+            # Drop the highlight from rows no longer associated.
+            for r in self._associated_rows - new_associated:
+                for c in range(cols):
+                    item = self.table.item(r, c)
+                    if item is not None:
+                        item.setBackground(clear_brush)
+            # Apply the highlight to newly associated rows.
+            for r in new_associated - self._associated_rows:
+                for c in range(cols):
+                    item = self.table.item(r, c)
+                    if item is not None:
+                        item.setBackground(tint_brush)
+            self._associated_rows = new_associated
+
+        # Show the first selected row's full details in the bottom pane.
+        if not selected:
             return
-        item = self.table.item(rows[0].row(), 1)
-        if not item:
-            return
-        entry = item.data(Qt.UserRole)
+        entry = self._entry_for_row(min(selected))
         if not entry:
             return
         text = (
@@ -2118,6 +2457,92 @@ class LogsTab(QWidget):
         if entry.get("details"):
             text += "\n\n" + entry["details"]
         self.details.setPlainText(text)
+
+    def _selected_entries(self) -> list[dict]:
+        rows = sorted(self._selected_row_set())
+        out = []
+        for r in rows:
+            entry = self._entry_for_row(r)
+            if entry:
+                out.append(entry)
+        return out
+
+    def _selected_plus_associated_entries(self) -> list[dict]:
+        selected = self._selected_row_set()
+        op_ids = {
+            e["op_id"]
+            for r in selected
+            if (e := self._entry_for_row(r)) and e.get("op_id") is not None
+        }
+        rows = set(selected)
+        if op_ids:
+            for r in range(self.table.rowCount()):
+                entry = self._entry_for_row(r)
+                if entry and entry.get("op_id") in op_ids:
+                    rows.add(r)
+        return [e for r in sorted(rows) if (e := self._entry_for_row(r))]
+
+    def _format_entries(self, entries: list[dict]) -> str:
+        lines = []
+        for e in entries:
+            lines.append(
+                f"[{e['ts']}] {e['direction'].upper()}/{e['level'].upper()}\t"
+                f"{e['source']}\t{e['message']}"
+            )
+            if e.get("details"):
+                for ln in e["details"].splitlines():
+                    lines.append(f"    {ln}")
+        return "\n".join(lines)
+
+    def _copy_selected_rows(self):
+        entries = self._selected_entries()
+        if not entries:
+            return
+        QApplication.clipboard().setText(self._format_entries(entries))
+
+    def _copy_selected_with_associated(self):
+        entries = self._selected_plus_associated_entries()
+        if not entries:
+            return
+        QApplication.clipboard().setText(self._format_entries(entries))
+
+    def _on_table_context_menu(self, pos):
+        menu = QMenu(self.table)
+        n_sel = len(self._selected_entries())
+        n_full = len(self._selected_plus_associated_entries())
+        n_assoc = max(0, n_full - n_sel)
+
+        copy = menu.addAction(
+            f"Copy ({n_sel} row{'s' if n_sel != 1 else ''})" if n_sel else "Copy"
+        )
+        copy.setShortcut(QKeySequence.Copy)
+        copy.setEnabled(n_sel > 0)
+        copy.triggered.connect(self._copy_selected_rows)
+
+        copy_grp = menu.addAction(
+            f"Copy with associated rows ({n_full} total, +{n_assoc})"
+            if n_assoc
+            else "Copy with associated rows"
+        )
+        copy_grp.setEnabled(n_assoc > 0)
+        copy_grp.triggered.connect(self._copy_selected_with_associated)
+
+        menu.addSeparator()
+        copy_all = menu.addAction("Copy all visible")
+        copy_all.triggered.connect(self._copy_all_visible)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _copy_all_visible(self):
+        entries = []
+        for r in range(self.table.rowCount()):
+            ts_item = self.table.item(r, 1)
+            if ts_item is None:
+                continue
+            e = ts_item.data(Qt.UserRole)
+            if e:
+                entries.append(e)
+        if entries:
+            QApplication.clipboard().setText(self._format_entries(entries))
 
 
 class SettingsTab(QWidget):
@@ -2154,7 +2579,7 @@ class SettingsTab(QWidget):
 
         theme_box = QGroupBox("Appearance")
         tform = QFormLayout(theme_box)
-        self.theme_combo = QComboBox()
+        self.theme_combo = FlatComboBox()
         self.theme_combo.addItems(list(THEMES.keys()))
         self.theme_combo.setCurrentText(cfg["theme"])
         tform.addRow("Theme", self.theme_combo)
@@ -2168,12 +2593,70 @@ class SettingsTab(QWidget):
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
 
+        layout.addWidget(self._build_about_box())
+        layout.addStretch(1)
+
+    def _build_about_box(self) -> "QGroupBox":
+        try:
+            from PySide6 import __version__ as pyside_version
+            from PySide6.QtCore import qVersion
+            qt_version = qVersion()
+        except Exception:
+            pyside_version = "?"
+            qt_version = "?"
+        try:
+            import pydicom
+            pydicom_version = getattr(pydicom, "__version__", "?")
+        except Exception:
+            pydicom_version = "?"
+        try:
+            import pynetdicom
+            pynetdicom_version = getattr(pynetdicom, "__version__", "?")
+        except Exception:
+            pynetdicom_version = "?"
+        try:
+            import numpy
+            numpy_version = numpy.__version__
+        except Exception:
+            numpy_version = "?"
+
+        py_version = platform.python_version()
+        plat = f"{platform.system()} {platform.release()} ({platform.machine()})"
+
+        html = f"""
+        <div style="line-height: 1.5;">
+          <p><b>{APP_NAME}</b> &nbsp;v{APP_VERSION}<br>
+          Portable DICOM tester &mdash; Echo / MWL / Store / Print + built-in SCP.</p>
+
+          <p>&copy; {APP_COPYRIGHT_YEAR} {APP_AUTHOR}. Released under the
+          <b>{APP_LICENSE}</b> License.<br>
+          Source: <a href="{APP_REPO_URL}">{APP_REPO_URL}</a></p>
+
+          <p><b>Disclaimer</b><br>
+          This software is provided for testing, development, and educational
+          use only. It is <b>not a medical device</b> and must <b>not</b> be used
+          for clinical diagnosis, treatment, or any patient-care decision.</p>
+
+          <p><b>Built with</b><br>
+          PySide6 {pyside_version} (Qt {qt_version}) &middot;
+          pydicom {pydicom_version} &middot;
+          pynetdicom {pynetdicom_version} &middot;
+          NumPy {numpy_version}</p>
+
+          <p><b>Runtime</b><br>
+          Python {py_version} &middot; {plat}</p>
+        </div>
+        """
+
         about = QGroupBox("About")
         a_layout = QVBoxLayout(about)
-        a_layout.addWidget(QLabel(f"{APP_NAME} v{APP_VERSION}"))
-        a_layout.addWidget(QLabel("Portable DICOM tester - Echo / MWL / Store / Print + built-in SCP."))
-        layout.addWidget(about)
-        layout.addStretch(1)
+        info = QLabel(html.strip())
+        info.setTextFormat(Qt.RichText)
+        info.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        info.setOpenExternalLinks(True)
+        info.setWordWrap(True)
+        a_layout.addWidget(info)
+        return about
 
     def apply(self):
         self.cfg["local_ae"] = self.ae_input.text().strip().upper() or "DICOMFLUX"
@@ -2364,6 +2847,17 @@ class DataTab(QWidget):
         target = QFileDialog.getExistingDirectory(self, "Save received DICOM files to...")
         if not target:
             return
+        target_path = Path(target)
+        try:
+            target_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            if _is_cfa_path(target_path):
+                _show_cfa_error_dialog(self, target_path)
+            else:
+                QMessageBox.warning(
+                    self, APP_NAME, f"Cannot use target folder:\n{target}\n\n{exc}"
+                )
+            return
         with RECEIVED_LOCK:
             snapshot = list(RECEIVED_FILES)
         saved = 0
@@ -2373,13 +2867,31 @@ class DataTab(QWidget):
                 continue
             rec = snapshot[idx]
             ds: Dataset = rec["dataset"]
-            stem = (rec["sop_instance"] or generate_uid())[-32:]
-            path = Path(target) / f"{stem}.dcm"
+            sop = rec["sop_instance"] or generate_uid()
+            # Build a filesystem-safe filename: replace dots with underscores
+            # so the SOP UID structure is preserved without breaking shells
+            # that treat dots specially, then cap length for Windows MAX_PATH.
+            stem = re.sub(r"[^A-Za-z0-9_\-]", "_", sop)[-64:] or "received"
+            path = target_path / f"{stem}.dcm"
             try:
-                ds.save_as(str(path), write_like_original=False)
+                # write_like_original was renamed to enforce_file_format in
+                # pydicom 3.0; try the modern keyword first and fall back.
+                try:
+                    ds.save_as(str(path), enforce_file_format=True)
+                except TypeError:
+                    ds.save_as(str(path), write_like_original=False)
                 saved += 1
             except Exception as exc:
                 errors.append(f"{stem}: {exc}")
+        # If saves failed and the destination looks like a CFA-protected folder,
+        # show the dedicated explanation dialog instead of a raw error dump.
+        if errors and saved < len(rows) and _is_cfa_path(target_path):
+            _show_cfa_error_dialog(self, target_path)
+            if saved > 0:
+                QMessageBox.information(
+                    self, APP_NAME, f"Saved {saved}/{len(rows)} file(s) to {target}"
+                )
+            return
         msg = f"Saved {saved}/{len(rows)} file(s) to {target}"
         if errors:
             msg += "\n\nErrors:\n" + "\n".join(errors)
