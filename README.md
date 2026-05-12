@@ -77,3 +77,17 @@ pyinstaller --onefile \
 The binary is written to `dist/[dicom.flux]`. Build on the target distro/glibc
 you intend to run on. Linux executables don't carry a file icon — use a
 `.desktop` entry pointing at `assets/dicom_flux.svg` for a launcher icon.
+
+## Demos
+
+### Echo (C-ECHO)
+
+![Sending a C-ECHO request](assets/demos/echo.gif)
+
+### Modality Worklist (C-FIND)
+
+![Querying a Modality Worklist provider](assets/demos/worklist.gif)
+
+### Send DICOM and Print
+
+![Sending a DICOM C-STORE and a print job](assets/demos/send-and-print.gif)

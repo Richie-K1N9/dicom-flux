@@ -2896,16 +2896,13 @@ def _ds_to_qpixmap(
             fm = FileMetaDataset()
             fm.TransferSyntaxUID = ImplicitVRLittleEndian
             ds.file_meta = fm
-            print(f"[ds_to_qpixmap] injected default TransferSyntaxUID={ImplicitVRLittleEndian}", flush=True)
-    except Exception as exc:
-        print(f"[ds_to_qpixmap] could not set file_meta: {exc}", flush=True)
+    except Exception:
+        pass
 
     arr = None
     try:
         arr = ds.pixel_array
-        print(f"[ds_to_qpixmap] pixel_array OK: shape={arr.shape} dtype={arr.dtype}", flush=True)
-    except Exception as exc:
-        print(f"[ds_to_qpixmap] pixel_array failed ({type(exc).__name__}: {exc}); trying manual decode", flush=True)
+    except Exception:
         # Fallback: manually decode raw pixel bytes for uncompressed data.
         try:
             rows = int(getattr(ds, "Rows", 0) or 0)
@@ -2915,30 +2912,22 @@ def _ds_to_qpixmap(
             signed = int(getattr(ds, "PixelRepresentation", 0) or 0) == 1
             pixel_bytes = ds.get((0x7FE0, 0x0010))
             pixel_bytes = pixel_bytes.value if pixel_bytes is not None else None
-            print(f"[ds_to_qpixmap] manual decode params: rows={rows} cols={cols} "
-                  f"samples={samples} bits={bits} signed={signed} "
-                  f"px_bytes_len={len(pixel_bytes) if pixel_bytes else 0}", flush=True)
             if not (rows and cols and pixel_bytes):
-                print("[ds_to_qpixmap] manual decode aborted: missing required field(s)", flush=True)
                 return None
             if bits == 8:
                 dtype = np.int8 if signed else np.uint8
             elif bits == 16:
                 dtype = np.int16 if signed else np.uint16
             else:
-                print(f"[ds_to_qpixmap] manual decode aborted: unsupported BitsAllocated={bits}", flush=True)
                 return None
             arr = np.frombuffer(pixel_bytes, dtype=dtype)
             if samples == 1:
                 arr = arr.reshape(rows, cols)
             else:
                 arr = arr.reshape(rows, cols, samples)
-            print(f"[ds_to_qpixmap] manual decode OK: shape={arr.shape} dtype={arr.dtype}", flush=True)
-        except Exception as exc2:
-            print(f"[ds_to_qpixmap] manual decode failed: {type(exc2).__name__}: {exc2}", flush=True)
+        except Exception:
             return None
     if arr is None:
-        print("[ds_to_qpixmap] arr is None after all paths", flush=True)
         return None
 
     slope = float(getattr(ds, "RescaleSlope", 1) or 1)
@@ -3297,35 +3286,13 @@ def _render_print_layout(record: dict) -> QPixmap:
     img_attrs = record.get("image_attrs")
     img_drawn = False
 
-    print(f"[print-preview] ----- opening print preview from {record.get('from_ae','?')} -----", flush=True)
-    print(f"[print-preview] image_attrs is None?  {img_attrs is None}", flush=True)
-    if img_attrs is not None:
-        try:
-            print(f"[print-preview] image_attrs len = {len(img_attrs)}", flush=True)
-            print(f"[print-preview] image_attrs top-level elements:", flush=True)
-            for elem in img_attrs:
-                vr = getattr(elem, "VR", "?")
-                kw = getattr(elem, "keyword", "") or ""
-                tag = getattr(elem, "tag", "?")
-                if vr == "SQ":
-                    n = len(elem.value) if elem.value else 0
-                    print(f"[print-preview]   {tag} {kw} VR=SQ items={n}", flush=True)
-                else:
-                    val = getattr(elem, "value", None)
-                    val_repr = repr(val)
-                    if len(val_repr) > 80:
-                        val_repr = val_repr[:77] + "..."
-                    print(f"[print-preview]   {tag} {kw} VR={vr} value={val_repr}", flush=True)
-        except Exception as exc:
-            print(f"[print-preview] failed to inspect image_attrs: {exc}", flush=True)
-
     if img_attrs is not None and len(img_attrs) > 0:
         # Locate the dataset that contains PixelData. dicom.flux SCU puts image
         # data in PreformattedGrayscaleImageSequence (tag 2020,0110); some other
         # implementations use BasicGrayscaleImageSequence or direct PixelData.
         img_ds = None
 
-        # 1. Try known sequence keywords / tags
+        # 1. Try known sequence tags / keywords
         for seq_tag in (
             (0x2020, 0x0110),  # PreformattedGrayscaleImageSequence
             (0x2020, 0x0111),  # PreformattedColorImageSequence
@@ -3333,10 +3300,7 @@ def _render_print_layout(record: dict) -> QPixmap:
             elem = img_attrs.get(seq_tag)
             if elem is not None and elem.VR == "SQ" and elem.value:
                 img_ds = elem.value[0]
-                print(f"[print-preview] step 1: found image dataset via tag {seq_tag}", flush=True)
                 break
-
-        # 2. Keyword-based access (works if pydicom knows the tag)
         if img_ds is None:
             for kw in ("PreformattedGrayscaleImageSequence",
                        "BasicGrayscaleImageSequence",
@@ -3344,56 +3308,27 @@ def _render_print_layout(record: dict) -> QPixmap:
                 seq = getattr(img_attrs, kw, None)
                 if seq:
                     img_ds = seq[0]
-                    print(f"[print-preview] step 2: found image dataset via keyword {kw}", flush=True)
                     break
 
-        # 3. PixelData directly on the attribute dataset
+        # 2. PixelData directly on the attribute dataset
         if img_ds is None and img_attrs.get((0x7FE0, 0x0010)) is not None:
             img_ds = img_attrs
-            print("[print-preview] step 3: PixelData found directly on img_attrs", flush=True)
 
-        # 4. Exhaustive: search every SQ element for a dataset with PixelData
+        # 3. Exhaustive: search every SQ element for a dataset with PixelData
         if img_ds is None:
             for elem in img_attrs:
                 if elem.VR == "SQ" and elem.value:
                     for item in elem.value:
                         if item.get((0x7FE0, 0x0010)) is not None:
                             img_ds = item
-                            print(f"[print-preview] step 4: found PixelData inside SQ {elem.tag}", flush=True)
                             break
                 if img_ds is not None:
                     break
 
-        if img_ds is None:
-            print("[print-preview] no image dataset located after all 4 steps", flush=True)
-        else:
-            try:
-                rows = img_ds.get((0x0028, 0x0010))
-                cols = img_ds.get((0x0028, 0x0011))
-                bits = img_ds.get((0x0028, 0x0100))
-                samples = img_ds.get((0x0028, 0x0002))
-                pi_el = img_ds.get((0x0028, 0x0004))
-                pd = img_ds.get((0x7FE0, 0x0010))
-                print(
-                    f"[print-preview] img_ds: Rows={rows.value if rows else None} "
-                    f"Columns={cols.value if cols else None} "
-                    f"BitsAllocated={bits.value if bits else None} "
-                    f"SamplesPerPixel={samples.value if samples else None} "
-                    f"PI={pi_el.value if pi_el else None} "
-                    f"PixelData_len={len(pd.value) if pd else 0}",
-                    flush=True,
-                )
-            except Exception as exc:
-                print(f"[print-preview] failed to inspect img_ds: {exc}", flush=True)
-
+        if img_ds is not None:
             try:
                 pm_img = _ds_to_qpixmap(img_ds, 0)
-                if pm_img is None:
-                    print("[print-preview] _ds_to_qpixmap returned None", flush=True)
-                elif pm_img.isNull():
-                    print("[print-preview] _ds_to_qpixmap returned a null QPixmap", flush=True)
-                else:
-                    print(f"[print-preview] rendered QPixmap {pm_img.width()}x{pm_img.height()}", flush=True)
+                if pm_img is not None and not pm_img.isNull():
                     scaled = pm_img.scaled(
                         img_area.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
                     )
@@ -3401,9 +3336,8 @@ def _render_print_layout(record: dict) -> QPixmap:
                     iy = img_area.y() + (img_area.height() - scaled.height()) // 2
                     p.drawPixmap(ix, iy, scaled)
                     img_drawn = True
-            except Exception as exc:
-                print(f"[print-preview] _ds_to_qpixmap raised: {type(exc).__name__}: {exc}", flush=True)
-    print(f"[print-preview] img_drawn = {img_drawn}", flush=True)
+            except Exception:
+                pass
 
     if not img_drawn:
         p.setPen(QColor("#2a2a3a"))
@@ -3780,7 +3714,7 @@ class MainWindow(QMainWindow):
     def __init__(self, cfg: dict):
         super().__init__()
         self.cfg = cfg
-        self.setWindowTitle(f"{APP_NAME}  v{APP_VERSION}")
+        self.setWindowTitle(APP_NAME)
         self.resize(1100, 760)
 
         self.tabs = QTabWidget()
