@@ -33,7 +33,7 @@ pip install pyinstaller
 ### Windows
 
 ```
-pyinstaller --onefile --windowed --icon assets\dicom_flux.ico --add-data "assets\dicom_flux.svg;assets" --name "[dicom.flux]" main.py
+pyinstaller --onefile --windowed --icon assets\dicom_flux.ico --version-file assets\version_info.txt --add-data "assets\dicom_flux.svg;assets" --name "[dicom.flux]" main.py
 ```
 
 ### Linux
